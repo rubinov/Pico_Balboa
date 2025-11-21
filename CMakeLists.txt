@@ -67,3 +67,31 @@ target_link_libraries(Pico_Balboa
 
 pico_add_extra_outputs(Pico_Balboa)
 
+# ====================================================================================
+# ENCODER TEST EXECUTABLE (Diagnostic Tool)
+# ====================================================================================
+
+add_executable(encoder_test
+    encoder_test.c
+)
+
+pico_set_program_name(encoder_test "Encoder_Test")
+pico_set_program_version(encoder_test "0.1")
+
+# Enable USB output for printf
+pico_enable_stdio_uart(encoder_test 0)
+pico_enable_stdio_usb(encoder_test 1)
+
+# Add the standard library
+target_link_libraries(encoder_test
+    pico_stdlib
+    hardware_gpio
+)
+
+# Add include directories
+target_include_directories(encoder_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+# Create UF2 file
+pico_add_extra_outputs(encoder_test)
