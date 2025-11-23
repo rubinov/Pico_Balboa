@@ -1,0 +1,61 @@
+// Simple Quadrature Counter (Strict Cycle Counting)
+// Logic:
+// 1. Wait for BOTH L_X and L_B to be LOW (00 state).
+// 2. Wait for L_B to go HIGH (Rising Edge).
+// 3. Check L_X state immediately:
+//    - If L_X is High (State 11) -> CW (+1)
+//    - If L_X is Low  (State 10) -> CCW (-1)
+// 4. Push value to FIFO.
+
+.program simple_quad_counter
+
+start:
+    ; 1. Stall until BOTH pins are LOW (00 state).
+    ; This enforces the "Full Rotation" logic and hysteresis.
+    wait 0 pin 0             ; Wait for L_X (Pin 0) to be LOW
+    wait 0 pin 1             ; Wait for L_B (Pin 1) to be LOW
+    
+    ; 2. Wait until pin L_B goes HIGH (Rising Edge).
+    wait 1 pin 1 [5]         ; [5] cycle delay for debounce.
+    
+    ; 3. Check L_X state for direction decision
+    ; 'jmp pin' checks the pin configured by sm_config_set_jmp_pin (L_X)
+    jmp pin, cw              ; If L_X is HIGH (State 11) -> CW
+    
+ccw:
+    ; If jump not taken, L_X is LOW (State 10) -> CCW
+    ; Push -1 (0xFFFFFFFF) to FIFO
+    mov isr, !null           
+    push block               
+    jmp start
+
+cw:
+    ; Push 1 to FIFO
+    set x, 1
+    mov isr, x
+    push block               
+    jmp start
+
+% c-sdk {
+static inline void simple_quad_counter_program_init(PIO pio, uint sm, uint offset, uint pin_x, uint pin_b) {
+    pio_sm_config c = simple_quad_counter_program_get_default_config(offset);
+
+    // Set the IN base pin to the provided L_X pin
+    sm_config_set_in_pins(&c, pin_x);
+    
+    // Set the JMP pin to the provided L_X pin
+    sm_config_set_jmp_pin(&c, pin_x);
+
+    // Initialize the GPIOs
+    pio_gpio_init(pio, pin_x);
+    pio_gpio_init(pio, pin_b);
+
+    // Set pin directions to input
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_x, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_b, 1, false);
+
+    // Load configuration and jump to start
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

@@ -1,89 +1,156 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "hardware/spi.h"
-#include "hardware/i2c.h"
 #include "hardware/pio.h"
-#include "hardware/timer.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/dma.h" 
+#include "encoders.pio.h" 
+#include "pico/time.h"
 
-// SPI Defines
-// We are going to use SPI 0, and allocate it to the following GPIO pins
-// Pins can be changed, see the GPIO function select table in the datasheet for information on GPIO assignments
-#define SPI_PORT spi0
-#define PIN_MISO 16
-#define PIN_CS   17
-#define PIN_SCK  18
-#define PIN_MOSI 19
+// --- PIN ASSIGNMENTS ---
+#define L_X_PIN 0   
+#define L_B_PIN 1   
+#define R_X_PIN 26  
+#define R_B_PIN 27  
+#define ENABLE_PIN 20  
 
-// I2C defines
-// This example will use I2C0 on GPIO8 (SDA) and GPIO9 (SCL) running at 400KHz.
-// Pins can be changed, see the GPIO function select table in the datasheet for information on GPIO assignments
-#define I2C_PORT i2c0
-#define I2C_SDA 8
-#define I2C_SCL 9
+// --- DMA BUFFER CONFIGURATION ---
+#define DMA_BUFFER_SIZE 1024 
+#define DMA_BUFFER_MASK (DMA_BUFFER_SIZE - 1) 
 
-#include "blink.pio.h"
+// --- GLOBALS ---
+PIO pio = pio0;
+uint sm_left = 0;
+uint sm_right = 1;
 
-void blink_pin_forever(PIO pio, uint sm, uint offset, uint pin, uint freq) {
-    blink_program_init(pio, sm, offset, pin);
-    pio_sm_set_enabled(pio, sm, true);
+// DMA Channels
+int dma_chan_left;
+int dma_chan_right;
 
-    printf("Blinking pin %d at %d Hz\n", pin, freq);
+// DMA Buffers - CRITICAL FIX HERE
+// 1. Aligned to 4096 bytes for hardware ring wrapping.
+// 2. Placed in ".non_cached_bss" section so CPU sees DMA writes immediately.
+// 3. Attributes placed at the END to satisfy GCC syntax requirements.
+volatile int32_t left_dma_buffer[DMA_BUFFER_SIZE] __attribute__((aligned(4096), section(".non_cached_bss")));
+volatile int32_t right_dma_buffer[DMA_BUFFER_SIZE] __attribute__((aligned(4096), section(".non_cached_bss")));
 
-    // PIO counter program takes 3 more cycles in total than we pass as
-    // input (wait for n + 1; mov; jmp)
-    pio->txf[sm] = (125000000 / (2 * freq)) - 3;
+// CPU Read Indices
+uint32_t left_read_index = 0;
+uint32_t right_read_index = 0;
+
+// Total Counts
+volatile int32_t left_count = 0;
+volatile int32_t right_count = 0;
+
+// --- DMA SETUP ---
+void setup_dma_encoders() {
+    // --- LEFT ENCODER DMA ---
+    dma_chan_left = dma_claim_unused_channel(true);
+    dma_channel_config c_left = dma_channel_get_default_config(dma_chan_left);
+    
+    channel_config_set_transfer_data_size(&c_left, DMA_SIZE_32); 
+    channel_config_set_read_increment(&c_left, false); 
+    channel_config_set_write_increment(&c_left, true); 
+    channel_config_set_dreq(&c_left, pio_get_dreq(pio, sm_left, false)); 
+    
+    channel_config_set_ring(&c_left, true, 12); // Wrap every 4096 bytes
+
+    dma_channel_configure(
+        dma_chan_left,
+        &c_left,
+        left_dma_buffer,        
+        &pio->rxf[sm_left],     
+        0xFFFFFFFF,             
+        true                    
+    );
+
+    // --- RIGHT ENCODER DMA ---
+    dma_chan_right = dma_claim_unused_channel(true);
+    dma_channel_config c_right = dma_channel_get_default_config(dma_chan_right);
+    
+    channel_config_set_transfer_data_size(&c_right, DMA_SIZE_32);
+    channel_config_set_read_increment(&c_right, false);
+    channel_config_set_write_increment(&c_right, true);
+    channel_config_set_dreq(&c_right, pio_get_dreq(pio, sm_right, false));
+    channel_config_set_ring(&c_right, true, 12); 
+
+    dma_channel_configure(
+        dma_chan_right,
+        &c_right,
+        right_dma_buffer,       
+        &pio->rxf[sm_right],    
+        0xFFFFFFFF,             
+        true                    
+    );
 }
 
-int64_t alarm_callback(alarm_id_t id, void *user_data) {
-    // Put your timeout handler code in here
-    return 0;
+// --- HARVESTER FUNCTION ---
+void update_encoder_counts() {
+    // --- Update Left ---
+    uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan_left].write_addr;
+    uint32_t left_write_index = (current_write_addr - (uint32_t)left_dma_buffer) / 4;
+    left_write_index &= DMA_BUFFER_MASK; 
+
+    while (left_read_index != left_write_index) {
+        left_count += left_dma_buffer[left_read_index];
+        left_read_index = (left_read_index + 1) & DMA_BUFFER_MASK;
+    }
+
+    // --- Update Right ---
+    uint32_t current_write_addr_r = (uint32_t)dma_hw->ch[dma_chan_right].write_addr;
+    uint32_t right_write_index = (current_write_addr_r - (uint32_t)right_dma_buffer) / 4;
+    right_write_index &= DMA_BUFFER_MASK;
+
+    while (right_read_index != right_write_index) {
+        right_count += right_dma_buffer[right_read_index];
+        right_read_index = (right_read_index + 1) & DMA_BUFFER_MASK;
+    }
 }
 
+void setup_pio_encoders() {
+    uint offset = pio_add_program(pio, &simple_quad_counter_program);
+    simple_quad_counter_program_init(pio, sm_left, offset, L_X_PIN, L_B_PIN);
+    simple_quad_counter_program_init(pio, sm_right, offset, R_X_PIN, R_B_PIN);
+}
 
+// --- MAIN APPLICATION ---
 
-int main()
-{
+int main() {
     stdio_init_all();
+    sleep_ms(2000); 
+    printf("RP2035 Encoder Application (Fixed Cache Syntax)\n");
 
-    // SPI initialisation. This example will use SPI at 1MHz.
-    spi_init(SPI_PORT, 1000*1000);
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_CS,   GPIO_FUNC_SIO);
-    gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_init(ENABLE_PIN);
+    gpio_set_dir(ENABLE_PIN, GPIO_OUT);
+    gpio_put(ENABLE_PIN, 1);
     
-    // Chip select is active-low, so we'll initialise it to a driven-high state
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1);
-    // For more examples of SPI use see https://github.com/raspberrypi/pico-examples/tree/master/spi
+    gpio_init(L_X_PIN); gpio_set_dir(L_X_PIN, GPIO_IN); gpio_pull_down(L_X_PIN);
+    gpio_init(L_B_PIN); gpio_set_dir(L_B_PIN, GPIO_IN); gpio_pull_down(L_B_PIN);
+    gpio_init(R_X_PIN); gpio_set_dir(R_X_PIN, GPIO_IN); gpio_pull_down(R_X_PIN);
+    gpio_init(R_B_PIN); gpio_set_dir(R_B_PIN, GPIO_IN); gpio_pull_down(R_B_PIN);
 
-    // I2C Initialisation. Using it at 400Khz.
-    i2c_init(I2C_PORT, 400*1000);
+    setup_pio_encoders();
+    setup_dma_encoders();
     
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-    // For more examples of I2C use see https://github.com/raspberrypi/pico-examples/tree/master/i2c
+    printf("--- Setup Complete ---\n");
+    printf("Reading @ 100Hz, Printing @ 10Hz\n");
 
-    // PIO Blinking example
-    PIO pio = pio0;
-    uint offset = pio_add_program(pio, &blink_program);
-    printf("Loaded program at %d\n", offset);
-    
-    #ifdef PICO_DEFAULT_LED_PIN
-    blink_pin_forever(pio, 0, offset, PICO_DEFAULT_LED_PIN, 3);
-    #else
-    blink_pin_forever(pio, 0, offset, 6, 3);
-    #endif
-    // For more pio examples see https://github.com/raspberrypi/pico-examples/tree/master/pio
-
-    // Timer example code - This example fires off the callback after 2000ms
-    add_alarm_in_ms(2000, alarm_callback, NULL, false);
-    // For more examples of timer use see https://github.com/raspberrypi/pico-examples/tree/master/timer
+    absolute_time_t next_loop_time = get_absolute_time();
+    int64_t loop_interval_us = 10000; // 10 milliseconds (100 Hz)
+    int print_decimator = 0;
 
     while (true) {
-        printf("Hello, world!\n");
-        sleep_ms(1000);
+        next_loop_time = delayed_by_us(next_loop_time, loop_interval_us);
+        best_effort_wfe_or_timeout(next_loop_time);
+
+        update_encoder_counts();
+
+        print_decimator++;
+        if (print_decimator >= 10) {
+            printf("Left Count: %8d | Right Count: %8d\n", left_count, right_count);
+            print_decimator = 0;
+        }
     }
+
+    return 0;
 }
