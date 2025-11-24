@@ -41,7 +41,7 @@ pico_generate_pio_header(Pico_Balboa ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
 pico_enable_stdio_uart(Pico_Balboa 0)
 pico_enable_stdio_usb(Pico_Balboa 1)
 
-# --- UPDATED: Added Bluetooth and Wireless Libraries ---
+# --- UPDATED: Fixed BTstack Library Linking ---
 target_link_libraries(Pico_Balboa
     pico_stdlib
     hardware_spi
@@ -54,7 +54,8 @@ target_link_libraries(Pico_Balboa
     pico_cyw43_arch_none 
     pico_btstack_classic
     pico_btstack_cyw43
-    btstack_run_loop
+    # FIX: Use the correct run loop for Pico SDK
+    pico_btstack_run_loop_async_context 
 )
 
 target_include_directories(Pico_Balboa PRIVATE

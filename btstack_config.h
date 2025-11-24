@@ -12,7 +12,11 @@
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
 
 // Enable Classic Bluetooth (RFCOMM/SPP)
+// Guard these to avoid "redefined" warnings from CMake
+#ifndef ENABLE_CLASSIC
 #define ENABLE_CLASSIC
+#endif
+
 #define ENABLE_L2CAP
 #define ENABLE_RFCOMM
 #define ENABLE_SDP
@@ -31,5 +35,9 @@
 #define MAX_NR_WHITELIST_ENTRIES 1
 #define MAX_NR_SM_LOOKUP_ENTRIES 3
 #define MAX_NR_SERVICE_RECORD_ITEMS 2
+
+// --- FIXED: Missing NVM Definition ---
+// Defines how many paired devices (Link Keys) to store in Flash memory.
+#define NVM_NUM_LINK_KEYS 16
 
 #endif // BTSTACK_CONFIG_H

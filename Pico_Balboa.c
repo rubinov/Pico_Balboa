@@ -50,7 +50,7 @@
 #define DMA_BUFFER_MASK (DMA_BUFFER_SIZE - 1) 
 
 // --- RECORDING CONFIGURATION ---
-#define MAX_RECORD_SAMPLES 50000
+#define MAX_RECORD_SAMPLES 5000
 
 typedef struct {
     uint32_t timestamp_us;
@@ -100,18 +100,8 @@ static int bt_cmd_idx = 0;
 
 // --- BLUETOOTH SPP SETUP ---
 
-// SDP Record for SPP (Standard Serial Port Profile)
-// This tells connected devices that we are a Serial Port.
-const uint8_t spp_service_buffer[] = {
-    0x35, 0x39, 0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00,
-    0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x01, 0x09, 0x00,
-    0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00,
-    0x01, 0x35, 0x06, 0x19, 0x00, 0x03, 0x08, 0x01, 0x09, 0x00,
-    0x05, 0x35, 0x03, 0x19, 0x10, 0x02, 0x09, 0x00, 0x06, 0x35,
-    0x09, 0x09, 0x65, 0x6e, 0x09, 0x00, 0x6a, 0x09, 0x01, 0x00,
-    0x09, 0x01, 0x00, 0x25, 0x0b, 0x50, 0x69, 0x63, 0x6f, 0x5f,
-    0x42, 0x61, 0x6c, 0x62, 0x6f, 0x61
-};
+// Buffer for SDP record (Must be RAM, populated at runtime)
+uint8_t spp_service_buffer[256];
 
 // Forward declaration for command processing
 void process_command(const char* cmd);
@@ -365,8 +355,8 @@ int main() {
     rfcomm_init();
     rfcomm_register_service(packet_handler, 1, 0xffff); // Channel 1
     sdp_init();
-    memset(spp_service_buffer, 0, sizeof(spp_service_buffer));
-    // Re-generate SDP record (using a simpler helper would be better but manual is robust)
+    
+    // Re-generate SDP record
     spp_create_sdp_record((uint8_t*)spp_service_buffer, 0x10001, 1, "Pico_Balboa");
     sdp_register_service((uint8_t*)spp_service_buffer);
     gap_set_local_name("Pico_Balboa");
