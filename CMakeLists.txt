@@ -7,7 +7,6 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
 if(WIN32)
     set(USERHOME $ENV{USERPROFILE})
 else()
@@ -20,20 +19,14 @@ set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
-# ====================================================================================
+
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
-# Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
 project(Pico_Balboa C CXX ASM)
 
-# Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
-
-# ====================================================================================
-# PICO_BALBOA EXECUTABLE
-# ====================================================================================
 
 add_executable(Pico_Balboa 
     Pico_Balboa.c
@@ -48,6 +41,7 @@ pico_generate_pio_header(Pico_Balboa ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
 pico_enable_stdio_uart(Pico_Balboa 0)
 pico_enable_stdio_usb(Pico_Balboa 1)
 
+# --- UPDATED: Added Bluetooth and Wireless Libraries ---
 target_link_libraries(Pico_Balboa
     pico_stdlib
     hardware_spi
@@ -56,6 +50,11 @@ target_link_libraries(Pico_Balboa
     hardware_timer
     hardware_gpio
     hardware_dma
+    # Bluetooth / Wireless support
+    pico_cyw43_arch_none 
+    pico_btstack_classic
+    pico_btstack_cyw43
+    btstack_run_loop
 )
 
 target_include_directories(Pico_Balboa PRIVATE
