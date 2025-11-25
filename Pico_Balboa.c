@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -62,7 +63,6 @@ typedef struct {
 
 DataPoint record_buffer[MAX_RECORD_SAMPLES];
 uint32_t record_index = 0;
-bool is_recording = false;
 
 // --- GLOBALS ---
 PIO pio = pio0;
@@ -86,24 +86,36 @@ volatile int32_t right_errors = 0;
 int16_t ax, ay, az;
 int16_t gx, gy, gz;
 
-int16_t current_motor_speed = 0;
-bool run_sequence_active = false;
-absolute_time_t run_start_time;
-
 char usb_cmd_buffer[32];
 int usb_cmd_idx = 0;
 
 // Bluetooth Globals
-static uint16_t rfcomm_channel_id;
+static uint16_t rfcomm_channel_id = 0; 
 static char bt_cmd_buffer[32];
 static int bt_cmd_idx = 0;
 
-// --- BLUETOOTH SPP SETUP ---
+// Flags for Main Loop execution
+volatile bool start_run_request = false;
+volatile bool start_read_request = false;
 
-// Buffer for SDP record (Must be RAM, populated at runtime)
+// --- BLUETOOTH HELPER ---
+void bt_printf(const char *format, ...) {
+    if (rfcomm_channel_id == 0) return; 
+
+    char buffer[128]; 
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    if (len > 0) {
+        rfcomm_send(rfcomm_channel_id, (uint8_t*)buffer, len);
+    }
+}
+
+// --- BLUETOOTH SPP SETUP ---
 uint8_t spp_service_buffer[256];
 
-// Forward declaration for command processing
 void process_command(const char* cmd);
 
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
@@ -121,6 +133,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                 } else {
                     rfcomm_channel_id = rfcomm_event_channel_opened_get_rfcomm_cid(packet);
                     printf("RFCOMM Connected, ID %d\n", rfcomm_channel_id);
+                    bt_printf("CONNECTED\n");
                 }
                 break;
             case RFCOMM_EVENT_CHANNEL_CLOSED:
@@ -131,13 +144,12 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                 break;
         }
     } else if (packet_type == RFCOMM_DATA_PACKET) {
-        // Handle incoming data from Bluetooth
         for (int i = 0; i < size; i++) {
             char c = (char)packet[i];
             if (c == '\n' || c == '\r') {
                 if (bt_cmd_idx > 0) {
-                    bt_cmd_buffer[bt_cmd_idx] = 0; // Null terminate
-                    printf("BT CMD: %s\n", bt_cmd_buffer); // Echo to USB for debug
+                    bt_cmd_buffer[bt_cmd_idx] = 0; 
+                    printf("BT CMD: %s\n", bt_cmd_buffer); 
                     process_command(bt_cmd_buffer);
                     bt_cmd_idx = 0;
                 }
@@ -151,7 +163,6 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 }
 
 // --- MOTOR FUNCTIONS ---
-
 void balboa_set_speeds(int16_t left_speed, int16_t right_speed) {
     uint8_t packet[5];
     packet[0] = CMD_ACTIVATE_MOTORS;
@@ -171,7 +182,6 @@ void init_motor_i2c() {
 }
 
 // --- LSM6DS3 FUNCTIONS ---
-
 void lsm6ds3_write_reg(uint8_t reg, uint8_t value) {
     uint8_t buf[2];
     buf[0] = reg;
@@ -206,7 +216,6 @@ void lsm6ds3_read_all() {
 }
 
 // --- ENCODER FUNCTIONS ---
-
 void setup_dma_encoders() {
     dma_chan_left = dma_claim_unused_channel(true);
     dma_channel_config c_left = dma_channel_get_default_config(dma_chan_left);
@@ -259,66 +268,118 @@ void setup_pio_encoders() {
     simple_quad_counter_program_init(pio, sm_right, offset, R_X_PIN, R_B_PIN);
 }
 
-// --- COMMAND PROCESSING ---
+// --- SEQUENCE HANDLERS (CALLED FROM MAIN) ---
+
+void run_blocking_sequence() {
+    printf("SEQ: Starting 3s Run...\n");
+    // Removed bt_printf here to avoid buffer issues during sequence start
+    
+    record_index = 0;
+    absolute_time_t start_time = get_absolute_time();
+    
+    int16_t current_speed = 0;
+    int16_t old_speed = -999; 
+
+    while (true) {
+        absolute_time_t t_now = get_absolute_time();
+        int64_t elapsed_us = absolute_time_diff_us(start_time, t_now);
+        
+        if (elapsed_us >= 3000000) break;
+
+        if (elapsed_us < 100000) current_speed = 300;
+        else if (elapsed_us < 200000) current_speed = -300;
+        else current_speed = 0;
+        
+        if (current_speed != old_speed) {
+            balboa_set_speeds(current_speed, current_speed);
+            old_speed = current_speed;
+        }
+
+        lsm6ds3_read_all();
+        update_counts();
+
+        if (record_index < MAX_RECORD_SAMPLES) {
+            DataPoint *p = &record_buffer[record_index];
+            p->timestamp_us = to_us_since_boot(t_now);
+            p->ax = ax; p->ay = ay; p->az = az;
+            p->gx = gx; p->gy = gy; p->gz = gz;
+            p->left_enc = left_total;
+            p->right_enc = right_total;
+            p->motor_cmd = current_speed;
+            record_index++;
+        }
+
+        sleep_ms(1); 
+    }
+
+    balboa_set_speeds(0, 0);
+    printf("SEQ: Complete. Recorded %d samples.\n", record_index);
+    bt_printf("SEQ: Complete. Recorded %d samples.\n", record_index);
+}
+
+void read_sequence() {
+    printf("CMD: Offloading Data... Records: %d\n", record_index);
+    bt_printf("CMD: Offloading Data... Records: %d\n", record_index);
+    balboa_set_speeds(0, 0); 
+
+    if (record_index == 0) {
+        printf("WARNING: No data recorded yet.\n");
+        bt_printf("WARNING: No data recorded yet.\n");
+        return;
+    }
+
+    printf("DATA_START\n");
+    bt_printf("DATA_START\n");
+    
+    printf("Idx,Time_us,AX,AY,AZ,GX,GY,GZ,LeftEnc,RightEnc,MotorCmd\n");
+    bt_printf("Idx,Time_us,AX,AY,AZ,GX,GY,GZ,LeftEnc,RightEnc,MotorCmd\n");
+
+    for (uint32_t i = 0; i < record_index; i++) {
+        DataPoint *p = &record_buffer[i];
+        
+        printf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                i, p->timestamp_us,
+                p->ax, p->ay, p->az,
+                p->gx, p->gy, p->gz,
+                p->left_enc, p->right_enc,
+                p->motor_cmd);
+
+        bt_printf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                i, p->timestamp_us,
+                p->ax, p->ay, p->az,
+                p->gx, p->gy, p->gz,
+                p->left_enc, p->right_enc,
+                p->motor_cmd);
+        
+        // Critical for BT transmission
+        sleep_ms(5); 
+        cyw43_arch_poll(); 
+    }
+    printf("DATA_END\n");
+    bt_printf("DATA_END\n");
+}
+
+// --- COMMAND PROCESSING (NON-BLOCKING) ---
 
 void process_command(const char* cmd) {
-    if (strncmp(cmd, "START", 5) == 0) {
-        printf("CMD: Recording Started\n");
-        record_index = 0;
-        is_recording = true;
-    } 
-    else if (strncmp(cmd, "STOP", 4) == 0) {
-        printf("CMD: Stopped\n");
-        is_recording = false;
-        run_sequence_active = false;
-        current_motor_speed = 0;
-        balboa_set_speeds(0, 0);
-    }
-    else if (strncmp(cmd, "RUN", 3) == 0) {
-        printf("CMD: Run Sequence Initiated\n");
-        // Start Run
-        run_sequence_active = true;
-        run_start_time = get_absolute_time();
-        current_motor_speed = -100; 
-        balboa_set_speeds(-100, -100);
-        
-        // Auto-start Recording
-        printf("CMD: Recording Started (RUN)\n");
-        record_index = 0;
-        is_recording = true;
+    if (strncmp(cmd, "RUN", 3) == 0) {
+        start_run_request = true;
     }
     else if (strncmp(cmd, "READ", 4) == 0) {
-        printf("CMD: Offloading Data...\n");
-        bool was_recording = is_recording;
-        is_recording = false; 
-        balboa_set_speeds(0, 0);
-
-        printf("DATA_START\n");
-        printf("Idx,Time_us,AX,AY,AZ,GX,GY,GZ,LeftEnc,RightEnc,MotorCmd\n");
-        for (uint32_t i = 0; i < record_index; i++) {
-            DataPoint *p = &record_buffer[i];
-            printf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-                   i, p->timestamp_us,
-                   p->ax, p->ay, p->az,
-                   p->gx, p->gy, p->gz,
-                   p->left_enc, p->right_enc,
-                   p->motor_cmd);
-        }
-        printf("DATA_END\n");
-        
-        if (was_recording) printf("WARNING: Recording was interrupted by READ.\n");
+        start_read_request = true;
     }
     else {
         printf("Unknown Command: %s\n", cmd);
+        bt_printf("Unknown Command: %s\n", cmd);
     }
 }
 
 void check_usb_input() {
-    int c = getchar_timeout_us(0); // Non-blocking read
+    int c = getchar_timeout_us(0); 
     if (c != PICO_ERROR_TIMEOUT) {
         if (c == '\n' || c == '\r') {
             if (usb_cmd_idx > 0) {
-                usb_cmd_buffer[usb_cmd_idx] = 0; // Null terminate
+                usb_cmd_buffer[usb_cmd_idx] = 0; 
                 process_command(usb_cmd_buffer);
                 usb_cmd_idx = 0;
             }
@@ -353,7 +414,7 @@ int main() {
     }
     l2cap_init();
     rfcomm_init();
-    rfcomm_register_service(packet_handler, 1, 0xffff); // Channel 1
+    rfcomm_register_service(packet_handler, 1, 0xffff); 
     sdp_init();
     
     // Re-generate SDP record
@@ -366,61 +427,24 @@ int main() {
     
     printf("--- RP2035 Ready (USB + Bluetooth). Waiting... ---\n");
 
-    absolute_time_t t_now;
-    uint32_t cycle_start_us;
-    
     while (true) {
-        t_now = get_absolute_time();
-        cycle_start_us = to_us_since_boot(t_now);
-
         // 1. Check USB Commands
         check_usb_input();
         
-        // 2. Poll Bluetooth (Wireless Stack)
+        // 2. Poll Bluetooth
         cyw43_arch_poll();
 
-        // 3. Run Sequence Logic
-        if (run_sequence_active) {
-            int64_t elapsed_us = absolute_time_diff_us(run_start_time, t_now);
-            if (elapsed_us >= 500000) { // 0.5 seconds
-                // Stop Motors
-                current_motor_speed = 0;
-                balboa_set_speeds(0, 0);
-                run_sequence_active = false;
-                
-                // Stop Recording automatically when Run is done
-                is_recording = false;
-                printf("INFO: Run Sequence Complete. Recording Stopped.\n");
-            }
+        // 3. Handle Flags (Execution Context)
+        if (start_run_request) {
+            start_run_request = false;
+            run_blocking_sequence();
         }
 
-        // 4. Read Sensors
-        lsm6ds3_read_all();
-
-        // 5. Update Encoders
-        update_counts();
-        
-        // 6. Send Motor Command
-        balboa_set_speeds(current_motor_speed, current_motor_speed);
-
-        // 7. Record Data
-        if (is_recording && record_index < MAX_RECORD_SAMPLES) {
-            DataPoint *p = &record_buffer[record_index];
-            p->timestamp_us = cycle_start_us;
-            p->ax = ax; p->ay = ay; p->az = az;
-            p->gx = gx; p->gy = gy; p->gz = gz;
-            p->left_enc = left_total;
-            p->right_enc = right_total;
-            p->motor_cmd = current_motor_speed;
-            
-            record_index++;
-            if (record_index >= MAX_RECORD_SAMPLES) {
-                printf("INFO: Memory Buffer Full. Stopping Recording.\n");
-                is_recording = false;
-            }
+        if (start_read_request) {
+            start_read_request = false;
+            read_sequence();
         }
-        
-        // 8. Sleep
+
         sleep_ms(1);
     }
     return 0;
