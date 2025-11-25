@@ -53,6 +53,9 @@
 // --- RECORDING CONFIGURATION ---
 #define MAX_RECORD_SAMPLES 5000
 
+// --- SEQUENCE CONFIGURATION ---
+#define MAX_STEPS 50
+
 typedef struct {
     uint32_t timestamp_us;
     int16_t ax, ay, az;
@@ -61,8 +64,17 @@ typedef struct {
     int16_t motor_cmd; 
 } DataPoint;
 
+typedef struct {
+    uint32_t duration_ms;
+    int16_t left_speed;
+    int16_t right_speed;
+} Step;
+
 DataPoint record_buffer[MAX_RECORD_SAMPLES];
 uint32_t record_index = 0;
+
+Step sequence[MAX_STEPS];
+int sequence_length = 0;
 
 // --- GLOBALS ---
 PIO pio = pio0;
@@ -86,17 +98,20 @@ volatile int32_t right_errors = 0;
 int16_t ax, ay, az;
 int16_t gx, gy, gz;
 
-char usb_cmd_buffer[32];
+char usb_cmd_buffer[64]; // Increased size for STEP params
 int usb_cmd_idx = 0;
 
 // Bluetooth Globals
 static uint16_t rfcomm_channel_id = 0; 
-static char bt_cmd_buffer[32];
+static char bt_cmd_buffer[64]; // Increased size for STEP params
 static int bt_cmd_idx = 0;
 
 // Flags for Main Loop execution
 volatile bool start_run_request = false;
 volatile bool start_read_request = false;
+volatile bool start_dma_dump_request = false;
+volatile bool start_show_seq_request = false;
+volatile bool start_help_request = false;
 
 // --- BLUETOOTH HELPER ---
 void bt_printf(const char *format, ...) {
@@ -154,7 +169,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                     bt_cmd_idx = 0;
                 }
             } else {
-                if (bt_cmd_idx < 31) {
+                if (bt_cmd_idx < 63) {
                     bt_cmd_buffer[bt_cmd_idx++] = c;
                 }
             }
@@ -271,50 +286,127 @@ void setup_pio_encoders() {
 // --- SEQUENCE HANDLERS (CALLED FROM MAIN) ---
 
 void run_blocking_sequence() {
-    printf("SEQ: Starting 3s Run...\n");
-    // Removed bt_printf here to avoid buffer issues during sequence start
-    
+    if (sequence_length == 0) {
+        printf("SEQ: No steps defined.\n");
+        bt_printf("SEQ: No steps defined.\n");
+        return;
+    }
+
+    printf("SEQ: Starting sequence with %d steps...\n", sequence_length);
     record_index = 0;
-    absolute_time_t start_time = get_absolute_time();
+    absolute_time_t run_start_time = get_absolute_time();
     
-    int16_t current_speed = 0;
-    int16_t old_speed = -999; 
-
-    while (true) {
-        absolute_time_t t_now = get_absolute_time();
-        int64_t elapsed_us = absolute_time_diff_us(start_time, t_now);
+    for (int i = 0; i < sequence_length; i++) {
+        Step s = sequence[i];
+        printf("SEQ: Step %d (Dur: %dms, L: %d, R: %d)\n", i, s.duration_ms, s.left_speed, s.right_speed);
         
-        if (elapsed_us >= 3000000) break;
-
-        if (elapsed_us < 100000) current_speed = 300;
-        else if (elapsed_us < 200000) current_speed = -300;
-        else current_speed = 0;
+        balboa_set_speeds(s.left_speed, s.right_speed);
         
-        if (current_speed != old_speed) {
-            balboa_set_speeds(current_speed, current_speed);
-            old_speed = current_speed;
+        // Use a relative timer for the step duration
+        absolute_time_t step_end_time = make_timeout_time_ms(s.duration_ms);
+
+        while (get_absolute_time() < step_end_time) {
+            
+            // Collect Data
+            lsm6ds3_read_all();
+            update_counts();
+            absolute_time_t t_now = get_absolute_time();
+
+            if (record_index < MAX_RECORD_SAMPLES) {
+                DataPoint *p = &record_buffer[record_index];
+                p->timestamp_us = to_us_since_boot(t_now);
+                p->ax = ax; p->ay = ay; p->az = az;
+                p->gx = gx; p->gy = gy; p->gz = gz;
+                p->left_enc = left_total;
+                p->right_enc = right_total;
+                // We record the left speed as the generic motor cmd for simple viz, 
+                // or you could expand struct to record both.
+                p->motor_cmd = s.left_speed; 
+                record_index++;
+            }
+
+            // Keep BT stack alive during long runs
+            cyw43_arch_poll();
+            sleep_ms(1); 
         }
-
-        lsm6ds3_read_all();
-        update_counts();
-
-        if (record_index < MAX_RECORD_SAMPLES) {
-            DataPoint *p = &record_buffer[record_index];
-            p->timestamp_us = to_us_since_boot(t_now);
-            p->ax = ax; p->ay = ay; p->az = az;
-            p->gx = gx; p->gy = gy; p->gz = gz;
-            p->left_enc = left_total;
-            p->right_enc = right_total;
-            p->motor_cmd = current_speed;
-            record_index++;
-        }
-
-        sleep_ms(1); 
     }
 
     balboa_set_speeds(0, 0);
     printf("SEQ: Complete. Recorded %d samples.\n", record_index);
     bt_printf("SEQ: Complete. Recorded %d samples.\n", record_index);
+}
+
+void dma_dump_sequence() {
+    printf("DMA: Dumping 1024 buffer entries...\n");
+    bt_printf("DMA: Dumping 1024 buffer entries...\n");
+    
+    // Snapshot current write pointers from DMA hardware registers
+    uint32_t l_curr_addr = (uint32_t)dma_hw->ch[dma_chan_left].write_addr;
+    uint32_t l_write_idx = (l_curr_addr - (uint32_t)left_dma_buffer) / 4;
+    l_write_idx &= DMA_BUFFER_MASK;
+    
+    uint32_t r_curr_addr = (uint32_t)dma_hw->ch[dma_chan_right].write_addr;
+    uint32_t r_write_idx = (r_curr_addr - (uint32_t)right_dma_buffer) / 4;
+    r_write_idx &= DMA_BUFFER_MASK;
+
+    printf("PTRS: L_Read=%d L_Write=%d | R_Read=%d R_Write=%d\n", left_read_index, l_write_idx, right_read_index, r_write_idx);
+    bt_printf("PTRS: L_Read=%d L_Write=%d | R_Read=%d R_Write=%d\n", left_read_index, l_write_idx, right_read_index, r_write_idx);
+
+    printf("Idx,LeftRaw,RightRaw\n");
+    bt_printf("Idx,LeftRaw,RightRaw\n");
+
+    for (int i = 0; i < DMA_BUFFER_SIZE; i++) {
+        // Print raw values as Hex for debugging bitmasks
+        printf("%d,0x%08X,0x%08X\n", i, left_dma_buffer[i], right_dma_buffer[i]);
+        bt_printf("%d,0x%08X,0x%08X\n", i, left_dma_buffer[i], right_dma_buffer[i]);
+        
+        // Poll frequently to prevent BT buffer overflow or connection timeouts during large dump
+        // INCREASED DELAY: Printing 1024 lines too fast floods the BT buffer.
+        // We now pause for 10ms every 16 lines to let the stack drain.
+        if ((i & 0x0F) == 0) { 
+            cyw43_arch_poll();
+            sleep_ms(10);
+        }
+    }
+    printf("DMA: Dump Complete\n");
+    bt_printf("DMA: Dump Complete\n");
+}
+
+void show_sequence() {
+    printf("SEQ: Current Sequence (%d steps):\n", sequence_length);
+    bt_printf("SEQ: Current Sequence (%d steps):\n", sequence_length);
+
+    if (sequence_length == 0) {
+        printf("  (Empty)\n");
+        bt_printf("  (Empty)\n");
+        return;
+    }
+
+    for (int i = 0; i < sequence_length; i++) {
+        Step s = sequence[i];
+        printf("  Step %d: Dur=%dms, L=%d, R=%d\n", i, s.duration_ms, s.left_speed, s.right_speed);
+        bt_printf("  Step %d: Dur=%dms, L=%d, R=%d\n", i, s.duration_ms, s.left_speed, s.right_speed);
+        cyw43_arch_poll(); 
+        sleep_ms(2);
+    }
+}
+
+void print_help() {
+    printf("--- Pico_Balboa Command List ---\n");
+    printf("  RUN             : Execute the current sequence\n");
+    printf("  READ            : Offload recorded data (CSV format)\n");
+    printf("  STEP i,ms,l,r   : Set step [i] with dur[ms] and speeds [l],[r]\n");
+    printf("  SHOW_SEQ        : Display current sequence steps\n");
+    printf("  DMA             : Dump raw DMA buffer (Debugging)\n");
+    printf("  HELP            : Show this list\n");
+
+    bt_printf("--- Command List ---\n");
+    bt_printf("  RUN\n");
+    bt_printf("  READ\n");
+    bt_printf("  STEP i,ms,l,r\n");
+    bt_printf("  SHOW_SEQ\n");
+    bt_printf("  DMA\n");
+    bt_printf("  HELP\n");
 }
 
 void read_sequence() {
@@ -368,6 +460,47 @@ void process_command(const char* cmd) {
     else if (strncmp(cmd, "READ", 4) == 0) {
         start_read_request = true;
     }
+    else if (strncmp(cmd, "DMA", 3) == 0) {
+        start_dma_dump_request = true;
+    }
+    else if (strncmp(cmd, "SHOW_SEQ", 8) == 0) {
+        start_show_seq_request = true;
+    }
+    else if (strncmp(cmd, "HELP", 4) == 0) {
+        start_help_request = true;
+    }
+    else if (strncmp(cmd, "STEP", 4) == 0) {
+        // Format: STEP idx, duration, left, right
+        int idx, dur, l, r;
+        // Try parsing with commas
+        int matches = sscanf(cmd + 4, "%d, %d, %d, %d", &idx, &dur, &l, &r);
+        if (matches < 4) {
+             // Try parsing with spaces if commas fail
+             matches = sscanf(cmd + 4, "%d %d %d %d", &idx, &dur, &l, &r);
+        }
+
+        if (matches == 4) {
+            if (idx >= 0 && idx < MAX_STEPS) {
+                sequence[idx].duration_ms = dur;
+                sequence[idx].left_speed = (int16_t)l;
+                sequence[idx].right_speed = (int16_t)r;
+                
+                // Update sequence length if we added a new step at the end
+                if (idx >= sequence_length) {
+                    sequence_length = idx + 1;
+                }
+                
+                printf("CMD: Set Step %d: %dms, L:%d, R:%d\n", idx, dur, l, r);
+                bt_printf("OK: Step %d set\n", idx);
+            } else {
+                printf("CMD: Error, Step Index %d out of bounds (Max %d)\n", idx, MAX_STEPS-1);
+                bt_printf("ERR: Index bounds\n");
+            }
+        } else {
+            printf("CMD: Error parsing STEP. Usage: STEP idx, dur, l, r\n");
+            bt_printf("ERR: Parse error\n");
+        }
+    }
     else {
         printf("Unknown Command: %s\n", cmd);
         bt_printf("Unknown Command: %s\n", cmd);
@@ -384,7 +517,7 @@ void check_usb_input() {
                 usb_cmd_idx = 0;
             }
         } else {
-            if (usb_cmd_idx < 31) {
+            if (usb_cmd_idx < 63) {
                 usb_cmd_buffer[usb_cmd_idx++] = (char)c;
             }
         }
@@ -406,6 +539,11 @@ int main() {
     lsm6ds3_init();
     init_motor_i2c();
     balboa_set_speeds(0, 0);
+    
+    // --- DEFAULT SEQUENCE ---
+    sequence[0] = (Step){100, 100, 100};
+    sequence[1] = (Step){1000, 0, 0};
+    sequence_length = 2;
     
     // --- BLUETOOTH INIT ---
     if (cyw43_arch_init()) {
@@ -443,6 +581,21 @@ int main() {
         if (start_read_request) {
             start_read_request = false;
             read_sequence();
+        }
+
+        if (start_dma_dump_request) {
+            start_dma_dump_request = false;
+            dma_dump_sequence();
+        }
+
+        if (start_show_seq_request) {
+            start_show_seq_request = false;
+            show_sequence();
+        }
+
+        if (start_help_request) {
+            start_help_request = false;
+            print_help();
         }
 
         sleep_ms(1);
