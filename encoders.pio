@@ -1,24 +1,24 @@
-// Rising Edge Detector
-// 1. Wait for B to be LOW (Arm).
-// 2. Wait for B to go HIGH (Trigger).
-// 3. Push state.
-// 4. Repeat.
+// Rising Edge Detector on X Channel (Pin 0 relative)
+// 1. Wait for X to be HIGH (Reset state).
+// 2. Wait for X to go LOW (Falling Edge Trigger).
+// 3. Capture X and B state.
+// 4. Push state.
+// 5. Repeat.
 
 .program simple_quad_counter
 
-    ; Force sync: Wait for B (Pin 1) to be LOW.
-    ; [31] adds a tiny ~250ns debounce to filter electrical ringing.
-    wait 1 pin 0 [31]
+    ; Force sync: Wait for X (Pin 0) to be HIGH.
+    wait 1 pin 0 [1]
 
 loop:
-    ; 1. Wait for Rising Edge of B
-    wait 0 pin 0 [1]   ; Wait for B to go HIGH
+    ; 1. Wait for Falling Edge of X
+    wait 0 pin 0 [1]   ; Wait for X to go LOW
     
     ; 2. Capture State immediately
-    in pins, 2          ; Capture L_X (bit 0) and L_B (bit 1)
+    in pins, 2          ; Capture L/R_X (bit 0) and L/R_B (bit 1)
     push block          ; Push to DMA
     
-    ; 3. Wait for B to go LOW (Reset for next cycle)
+    ; 3. Wait for X to go HIGH (Reset for next cycle)
     wait 1 pin 0 [1]   
     
     jmp loop
