@@ -1,5 +1,20 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.2.0)
+set(toolchainVersion 14_2_Rel1)
+set(picotoolVersion 2.2.0-a4)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
 # Generated Cmake Pico project file
-# Updated: November 21, 2024, 6:59 PM CST
+# Modified for Encoder Debug Version
+# Updated: November 25, 2025
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -24,25 +39,25 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
 
-project(Pico_Balboa C CXX ASM)
+project(Pico_Balboa_encoder_debug C CXX ASM)
 
 pico_sdk_init()
 
-add_executable(Pico_Balboa 
-    Pico_Balboa.c
+add_executable(Pico_Balboa_encoder_debug 
+    Pico_Balboa_encoder_debug.c
 )
 
-pico_set_program_name(Pico_Balboa "Pico_Balboa")
-pico_set_program_version(Pico_Balboa "0.1")
+pico_set_program_name(Pico_Balboa_encoder_debug "Pico_Balboa_encoder_debug")
+pico_set_program_version(Pico_Balboa_encoder_debug "0.1")
 
 # Generate PIO header from encoders.pio
-pico_generate_pio_header(Pico_Balboa ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
+pico_generate_pio_header(Pico_Balboa_encoder_debug ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
 
-pico_enable_stdio_uart(Pico_Balboa 0)
-pico_enable_stdio_usb(Pico_Balboa 1)
+pico_enable_stdio_uart(Pico_Balboa_encoder_debug 0)
+pico_enable_stdio_usb(Pico_Balboa_encoder_debug 1)
 
-# --- UPDATED: Fixed BTstack Library Linking ---
-target_link_libraries(Pico_Balboa
+# --- Bluetooth and Hardware Libraries ---
+target_link_libraries(Pico_Balboa_encoder_debug
     pico_stdlib
     hardware_spi
     hardware_i2c
@@ -54,12 +69,12 @@ target_link_libraries(Pico_Balboa
     pico_cyw43_arch_none 
     pico_btstack_classic
     pico_btstack_cyw43
-    # FIX: Use the correct run loop for Pico SDK
+    # BTstack run loop for Pico SDK
     pico_btstack_run_loop_async_context 
 )
 
-target_include_directories(Pico_Balboa PRIVATE
+target_include_directories(Pico_Balboa_encoder_debug PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-pico_add_extra_outputs(Pico_Balboa)
+pico_add_extra_outputs(Pico_Balboa_encoder_debug)

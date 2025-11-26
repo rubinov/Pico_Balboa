@@ -69,6 +69,9 @@ uint sm_right = 1;
 int dma_chan_left;
 int dma_chan_right;
 
+volatile uint8_t left_prev_state = 0xFF;   // Track previous state
+volatile uint8_t right_prev_state = 0xFF;  // Initialize to invalid
+
 volatile int32_t left_dma_buffer[DMA_BUFFER_SIZE] __attribute__((aligned(4096)));
 volatile int32_t right_dma_buffer[DMA_BUFFER_SIZE] __attribute__((aligned(4096)));
 
@@ -203,41 +206,66 @@ void setup_dma_encoders() {
     dma_channel_configure(dma_chan_right, &c_right, right_dma_buffer, &pio->rxf[sm_right], 0xFFFFFFFF, true);
 }
 
-// MODIFIED: Now stores last raw values for debugging
+int8_t quadrature_decode(uint8_t prev, uint8_t curr) {
+    if (prev == 0xFF) return 0;  // First call initialization
+    
+    // Lookup table: [prev_state][curr_state] = direction
+    static const int8_t lut[4][4] = {
+        { 0,  1, -1,  0},  // From state 0
+        {-1,  0,  0,  1},  // From state 1
+        { 1,  0,  0, -1},  // From state 2
+        { 0, -1,  1,  0}   // From state 3
+    };
+    
+    return lut[prev & 0x3][curr & 0x3];
+}
+
 void update_counts() {
+    // LEFT encoder
     uint32_t l_curr_addr = (uint32_t)dma_hw->ch[dma_chan_left].write_addr;
     uint32_t l_write_idx = (l_curr_addr - (uint32_t)left_dma_buffer) / 4;
     l_write_idx &= DMA_BUFFER_MASK;
 
     while (left_read_index != l_write_idx) {
-        int32_t val = left_dma_buffer[left_read_index] & 0x3; 
-        last_left_raw = (uint8_t)val;  // Store for recording
+        uint8_t val = left_dma_buffer[left_read_index] & 0x3;
+        last_left_raw = val;  // Store for recording
         
-        if (val == 0) left_total++;
-        else if (val == 2) left_total--;
-        else left_errors++;
+        // SIMPLE 2X DECODER:
+        // Check bit 1 (B channel): 0 = forward, 1 = reverse
+        if ((val & 0x2) == 0) {
+            left_total++;   // B=0 at X edge: forward
+        } else {
+            left_total--;   // B=1 at X edge: reverse
+        }
+        
         left_read_index = (left_read_index + 1) & DMA_BUFFER_MASK;
     }
 
+    // RIGHT encoder
     uint32_t r_curr_addr = (uint32_t)dma_hw->ch[dma_chan_right].write_addr;
     uint32_t r_write_idx = (r_curr_addr - (uint32_t)right_dma_buffer) / 4;
     r_write_idx &= DMA_BUFFER_MASK;
 
     while (right_read_index != r_write_idx) {
-        int32_t val = right_dma_buffer[right_read_index] & 0x3;
-        last_right_raw = (uint8_t)val;  // Store for recording
+        uint8_t val = right_dma_buffer[right_read_index] & 0x3;
+        last_right_raw = val;  // Store for recording
         
-        if (val == 0) right_total++;
-        else if (val == 2) right_total--;
-        else right_errors++;
+        // SIMPLE 2X DECODER:
+        if ((val & 0x2) == 0) {
+            right_total++;   // B=0 at X edge: forward
+        } else {
+            right_total--;   // B=1 at X edge: reverse
+        }
+        
         right_read_index = (right_read_index + 1) & DMA_BUFFER_MASK;
     }
 }
 
+
 void setup_pio_encoders() {
-    uint offset = pio_add_program(pio, &simple_quad_counter_program);
-    simple_quad_counter_program_init(pio, sm_left, offset, L_X_PIN, L_B_PIN);
-    simple_quad_counter_program_init(pio, sm_right, offset, R_X_PIN, R_B_PIN);
+    uint offset = pio_add_program(pio, &quad_both_edges_program);
+    quad_both_edges_program_init(pio, sm_left, offset, L_X_PIN, L_B_PIN);
+    quad_both_edges_program_init(pio, sm_right, offset, R_X_PIN, R_B_PIN);
 }
 
 // --- SEQUENCE HANDLERS (CALLED FROM MAIN) ---

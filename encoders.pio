@@ -1,44 +1,49 @@
-// Rising Edge Detector on X Channel (Pin 0 relative)
-// 1. Wait for X to be HIGH (Reset state).
-// 2. Wait for X to go LOW (Falling Edge Trigger).
-// 3. Capture X and B state.
-// 4. Push state.
-// 5. Repeat.
+// QUADRATURE ENCODER - BOTH EDGES (2X Resolution)
+// Captures state on BOTH rising and falling edges of X channel
+// Simple decoder: Check B value at each X edge for direction
+//
+// Resolution: 2X (twice per encoder cycle)
+// Decoder: if (B==0) forward, if (B==1) reverse
 
-.program simple_quad_counter
+.program quad_both_edges
 
-    ; Force sync: Wait for X (Pin 0) to be HIGH.
-    wait 1 pin 0 [1]
-
-loop:
-    ; 1. Wait for Falling Edge of X
-    wait 0 pin 0 [1]   ; Wait for X to go LOW
+.wrap_target
+    ; Detect falling edge of X
+    wait 1 pin 0        ; Wait for X to be HIGH
+    wait 0 pin 0        ; Wait for X to go LOW (falling edge)
+    in pins, 2          ; Capture both X (bit 0) and B (bit 1)
+    push block          ; Push to DMA FIFO
     
-    ; 2. Capture State immediately
-    in pins, 2          ; Capture L/R_X (bit 0) and L/R_B (bit 1)
-    push block          ; Push to DMA
-    
-    ; 3. Wait for X to go HIGH (Reset for next cycle)
-    wait 1 pin 0 [1]   
-    
-    jmp loop
+    ; Detect rising edge of X
+    wait 0 pin 0        ; Wait for X to be LOW
+    wait 1 pin 0        ; Wait for X to go HIGH (rising edge)
+    in pins, 2          ; Capture both X (bit 0) and B (bit 1)
+    push block          ; Push to DMA FIFO
+.wrap
 
 % c-sdk {
-static inline void simple_quad_counter_program_init(PIO pio, uint sm, uint offset, uint pin_x, uint pin_b) {
-    pio_sm_config c = simple_quad_counter_program_get_default_config(offset);
+static inline void quad_both_edges_program_init(PIO pio, uint sm, uint offset, uint pin_x, uint pin_b) {
+    pio_sm_config c = quad_both_edges_program_get_default_config(offset);
 
+    // Set input pins starting at pin_x (will read 2 consecutive pins)
     sm_config_set_in_pins(&c, pin_x);
+    
+    // Initialize GPIO pins for PIO use
     pio_gpio_init(pio, pin_x);
     pio_gpio_init(pio, pin_b);
+    
+    // Set both pins as inputs
     pio_sm_set_consecutive_pindirs(pio, sm, pin_x, 1, false);
     pio_sm_set_consecutive_pindirs(pio, sm, pin_b, 1, false);
     
-    // Shift Left (LSB) so 01 reads as 1, 10 reads as 2, 11 reads as 3.
+    // Shift left (LSB first): bit 0 = X, bit 1 = B
+    // So: 0b00=0, 0b01=1, 0b10=2, 0b11=3
     sm_config_set_in_shift(&c, false, false, 32);
     
-    // NO CLOCK DIVIDER (Full Speed)
+    // Run at full speed (no clock divider)
     sm_config_set_clkdiv(&c, 1.0f);
 
+    // Initialize and enable the state machine
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
