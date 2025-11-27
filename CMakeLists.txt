@@ -39,25 +39,25 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
 
-project(Pico_Balboa_encoder_debug C CXX ASM)
+project(Pico_Balboa C CXX ASM)
 
 pico_sdk_init()
 
-add_executable(Pico_Balboa_encoder_debug 
-    Pico_Balboa_encoder_debug.c
+add_executable(Pico_Balboa 
+    Pico_Balboa.c
 )
 
-pico_set_program_name(Pico_Balboa_encoder_debug "Pico_Balboa_encoder_debug")
-pico_set_program_version(Pico_Balboa_encoder_debug "0.1")
+pico_set_program_name(Pico_Balboa "Pico_Balboa")
+pico_set_program_version(Pico_Balboa "0.1")
 
 # Generate PIO header from encoders.pio
-pico_generate_pio_header(Pico_Balboa_encoder_debug ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
+pico_generate_pio_header(Pico_Balboa ${CMAKE_CURRENT_LIST_DIR}/encoders.pio)
 
-pico_enable_stdio_uart(Pico_Balboa_encoder_debug 0)
-pico_enable_stdio_usb(Pico_Balboa_encoder_debug 1)
+pico_enable_stdio_uart(Pico_Balboa 0)
+pico_enable_stdio_usb(Pico_Balboa 1)
 
 # --- Bluetooth and Hardware Libraries ---
-target_link_libraries(Pico_Balboa_encoder_debug
+target_link_libraries(Pico_Balboa
     pico_stdlib
     hardware_spi
     hardware_i2c
@@ -73,8 +73,8 @@ target_link_libraries(Pico_Balboa_encoder_debug
     pico_btstack_run_loop_async_context 
 )
 
-target_include_directories(Pico_Balboa_encoder_debug PRIVATE
+target_include_directories(Pico_Balboa PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-pico_add_extra_outputs(Pico_Balboa_encoder_debug)
+pico_add_extra_outputs(Pico_Balboa)

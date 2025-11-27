@@ -16,10 +16,10 @@
 #include "btstack.h"
 
 // --- PIN ASSIGNMENTS ---
-#define L_X_PIN 0   
-#define L_B_PIN 1   
-#define R_X_PIN 27  
-#define R_B_PIN 26  
+#define L_X_PIN 27   
+#define L_B_PIN 26  
+#define R_X_PIN 1  
+#define R_B_PIN 0  
 #define ENABLE_PIN 20
 
 // --- I2C0: MOTOR CONTROLLER (100kHz) ---
