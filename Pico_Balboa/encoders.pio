@@ -1,0 +1,45 @@
+// Rising Edge Detector on X Channel (Pin 0 relative)
+// 1. Wait for X to be HIGH (Reset state).
+// 2. Wait for X to go LOW (Falling Edge Trigger).
+// 3. Capture X and B state.
+// 4. Push state.
+// 5. Repeat.
+
+.program simple_quad_counter
+
+    ; Force sync: Wait for X (Pin 0) to be HIGH.
+    wait 1 pin 0 [1]
+
+loop:
+    ; 1. Wait for Falling Edge of X
+    wait 0 pin 0 [1]   ; Wait for X to go LOW
+    
+    ; 2. Capture State immediately
+    in pins, 2          ; Capture L/R_X (bit 0) and L/R_B (bit 1)
+    push block          ; Push to DMA
+    
+    ; 3. Wait for X to go HIGH (Reset for next cycle)
+    wait 1 pin 0 [1]   
+    
+    jmp loop
+
+% c-sdk {
+static inline void simple_quad_counter_program_init(PIO pio, uint sm, uint offset, uint pin_x, uint pin_b) {
+    pio_sm_config c = simple_quad_counter_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, pin_x);
+    pio_gpio_init(pio, pin_x);
+    pio_gpio_init(pio, pin_b);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_x, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_b, 1, false);
+    
+    // Shift Left (LSB) so 01 reads as 1, 10 reads as 2, 11 reads as 3.
+    sm_config_set_in_shift(&c, false, false, 32);
+    
+    // NO CLOCK DIVIDER (Full Speed)
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
