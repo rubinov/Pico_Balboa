@@ -1,8 +1,8 @@
 // Pico_Balboa.c
-// Generated: November 30, 2024 at 16:45 UTC
+// Generated: November 30, 2024 at 18:15 UTC
 // Raspberry Pi Pico 2 W - Balboa Robot Balance Controller
-// Pololu-style algorithm: Gyro integration, incremental motor control, differential correction
-// No encoder position/velocity feedback, angle-based fall detection
+// Hardware: 620 counts/rev encoders, 80mm wheels, GEAR_RATIO=76
+// Recording: 11 fields including trajectory_error, encoders reset after INIT
 
 #include <stdio.h>
 #include <string.h>
@@ -77,11 +77,12 @@ typedef enum {
 } CommandType;
 
 typedef struct {
-    uint32_t timestamp_us;
-    int16_t ax, ay, az;
-    int16_t gx, gy, gz;
+    uint32_t timestamp_us;      // Microseconds since boot
+    int16_t ax, ay, az;         // ax=accel_x, ay=accel_z, az=gyro_y
+    int16_t gx, gy, gz;         // gx=motor_cmd_left, gy=motor_cmd_right, gz=angle(deg)
     int32_t left_enc, right_enc;
-    int16_t motor_cmd; 
+    int16_t motor_cmd;          // Base motor command (motorSpeed)
+    int16_t trajectory_error;   // risingAngleOffset (deg)
 } DataPoint;
 
 typedef struct {
@@ -96,6 +97,7 @@ typedef struct {
 
 DataPoint record_buffer[MAX_RECORD_SAMPLES];
 uint32_t record_index = 0;
+bool is_recording = false;  // True during critical data recording (after INIT, before fall)
 
 Step sequence[MAX_STEPS];
 int sequence_length = 0;
@@ -134,23 +136,32 @@ int32_t target_right = 0;
 // PID Variables
 float pid_integral_error = 0.0f; // Accumulator for I term
 
-
+// --- POLOLU-STYLE BALANCE VARIABLES ---
 float angle = 0.0f;               // Angle in degrees (0 = vertical)
 float angleRate = 0.0f;           // Angular rate in degrees/s
+float risingAngleOffset = 0.0f;   // Trajectory error (angleRate*140 + angle)
 int16_t motorSpeed = 0;           // Accumulated motor speed command
 int32_t distanceLeft = 0;         // Left encoder position (for differential correction)
 int32_t distanceRight = 0;        // Right encoder position (for differential correction)
 
 // Pololu-style control gains (tunable at runtime)
-int16_t ANGLE_RATE_RATIO = 140;      // Physical constant relating angle to rate
+int16_t ANGLE_RATE_RATIO = 140;      // Physical constant relating angle to rate (ms)
 int16_t ANGLE_RESPONSE = 11;         // Trajectory stabilization gain
-int16_t DISTANCE_DIFF_RESPONSE = -50; // Differential correction gain
-int16_t GEAR_RATIO = 111;            // Overall gear ratio
+int16_t DISTANCE_DIFF_RESPONSE = 0;  // Differential correction gain (start disabled)
+int16_t GEAR_RATIO = 76;             // Gear ratio (620 counts/rev, 80mm wheels)
 int16_t MOTOR_SPEED_LIMIT = 300;     // Maximum motor speed
+
+// Hardware specifications (for reference):
+// - Encoder: 620 counts per wheel rotation
+// - Wheel diameter: 80mm
+// - Wheel circumference: π × 80mm = 251.3mm
+// - Distance per count: 251.3mm / 620 = 0.405mm/count
+// Note: GEAR_RATIO scales motor commands to physical motion
+//       Adjusted from Pololu default (111) based on encoder ratio (620/910)
 
 // PID parameters (Defaults, adjust via PID command)
 // Note: P is now acting on Accel Z, D is acting on Gyro Y
-float balance_kp = 1.0f;    // Proportional gain (Accel Z error)
+float balance_kp = 0.05;    // Proportional gain (Accel Z error)
 float balance_ki = 0.00;    // Integral gain (Accel Z accumulation)
 float balance_kd = 0.50;    // Derivative gain (Gyro Y rate)
 
@@ -662,8 +673,13 @@ void calibrate_gyros(uint32_t duration_ms) {
         distanceLeft = 0;
         distanceRight = 0;
         
+        // Reset encoder counts to zero
+        left_total = 0;
+        right_total = 0;
+        
         printf("INIT: Gyro zeros: GX=%d, GY=%d, GZ=%d\n", gx_zero, gy_zero, gz_zero);
         printf("INIT: Initial angle: %.2f deg (AX=%ld, AZ=%ld)\n", angle, avg_ax, avg_az);
+        printf("INIT: Encoder counts reset to zero\n");
         bt_printf("INIT: Calibrated. Angle=%.1f deg\n", angle);
     }
 }
@@ -672,7 +688,7 @@ void calibrate_gyros(uint32_t duration_ms) {
 void integrateGyro() {
     // Convert gyro reading to deg/s
     // LSM6DS3 at ±1000 dps: 1000 dps = 29000 counts (from LSM6 library scaling)
-    angleRate = (float)(gy - gy_zero) / 32.768; // deg/s
+    angleRate = (float)(gy - gy_zero) / 29.0f;
     
     // Integrate to get angle (UPDATE_TIME_MS = 10ms)
     angle += angleRate * (UPDATE_TIME_MS / 1000.0f);
@@ -707,7 +723,7 @@ void balance_update() {
     // 2. Calculate rising angle offset (trajectory error)
     // This represents how far we are from a stable trajectory to vertical
     // Units: degrees (angleRate is deg/s, ANGLE_RATE_RATIO converts to deg)
-    float risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
+    risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
     
     // 3. Incremental motor speed update (Pololu-style)
     // Note: No distance/speed feedback per user request, only trajectory stabilization
@@ -733,15 +749,16 @@ void balance_update() {
     
     // 7. Fall detection based on angle
     static int fall_angle_count = 0;
-    if (fabsf(angle) > 30.0f) {  // Beyond 30 degrees from vertical
+    if (fabsf(angle) > 70.0f) {  // Beyond 70 degrees from vertical
         if (++fall_angle_count > 5) {  // 50ms of being too far
-            printf("FALL DETECTED: Angle=%.1f degrees\n", angle);
-            bt_printf("FALL DETECTED: Angle too large\n");
             is_balancing = false;
+            is_recording = false;  // Stop recording on fall
             motorSpeed = 0;
             balboa_set_speeds(0, 0);
             actual_motor_cmd = 0;
             fall_angle_count = 0;
+            printf("FALL DETECTED: Angle=%.1f degrees. Recording stopped.\n", angle);
+            bt_printf("FALL DETECTED: Angle too large\n");
         }
     } else {
         fall_angle_count = 0;
@@ -750,8 +767,10 @@ void balance_update() {
 
 // Stand up routine - Pololu-style with angle-based triggering
 void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold) {
-    printf("STAND: Pololu-style stand-up (s1=%d, s2=%d)...\n", speed1, speed2);
-    bt_printf("STAND: Starting stand-up\n");
+    if (!is_recording) {
+        printf("STAND: Pololu-style stand-up (s1=%d, s2=%d)...\n", speed1, speed2);
+        bt_printf("STAND: Starting stand-up\n");
+    }
     
     // Reset control state
     motorSpeed = 0;
@@ -772,15 +791,27 @@ void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold)
             integrateGyro();
             integrateEncoders();
             
-            if (record_index < MAX_RECORD_SAMPLES) {
+            // Calculate trajectory error for recording
+            risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
+            
+            // Calculate actual motor commands
+            int32_t distanceDiff = distanceLeft - distanceRight;
+            int16_t leftMotor = motorSpeed + (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+            int16_t rightMotor = motorSpeed - (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+            
+            if (is_recording && record_index < MAX_RECORD_SAMPLES) {
                 DataPoint *p = &record_buffer[record_index];
                 p->timestamp_us = to_us_since_boot(t_now);
-                p->ax = ax; p->ay = ay; p->az = az;
-                p->gx = (int16_t)angle;  // Angle in degrees
-                p->gy = (int16_t)angleRate;  // Rate in deg/s
-                p->gz = motorSpeed;
-                p->left_enc = left_total; p->right_enc = right_total;
-                p->motor_cmd = actual_motor_cmd;
+                p->ax = ax;                         // Accelerometer X
+                p->ay = az;                         // Accelerometer Z
+                p->az = gy;                         // Gyro Y (raw)
+                p->gx = leftMotor;                  // Left motor command (actual)
+                p->gy = rightMotor;                 // Right motor command (actual)
+                p->gz = (int16_t)angle;             // Angle (degrees)
+                p->left_enc = left_total;
+                p->right_enc = right_total;
+                p->motor_cmd = motorSpeed;          // Base motor command
+                p->trajectory_error = (int16_t)risingAngleOffset;  // Trajectory error
                 record_index++;
             }
             last_update = t_now;
@@ -802,10 +833,20 @@ void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold)
             integrateGyro();
             integrateEncoders();
             
-            // Check if close enough to vertical (angle < 60°)
-            if (fabsf(angle) < 60.0f) {
-                printf("STAND: Triggered at angle=%.1f degrees\n", angle);
-                bt_printf("STAND: Balancing started\n");
+            // Calculate trajectory error for recording
+            risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
+            
+            // Calculate actual motor commands
+            int32_t distanceDiff = distanceLeft - distanceRight;
+            int16_t leftMotor = motorSpeed + (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+            int16_t rightMotor = motorSpeed - (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+            
+            // Check if close enough to vertical (angle < 45°)
+            if (fabsf(angle) < 45.0f) {
+                if (!is_recording) {
+                    printf("STAND: Triggered at angle=%.1f degrees\n", angle);
+                    bt_printf("STAND: Balancing started\n");
+                }
                 is_balancing = true;
                 motorSpeed = 150;  // Pre-load motor speed
                 distanceLeft = 0;   // Reset for differential correction
@@ -813,15 +854,19 @@ void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold)
                 break;
             }
             
-            if (record_index < MAX_RECORD_SAMPLES) {
+            if (is_recording && record_index < MAX_RECORD_SAMPLES) {
                 DataPoint *p = &record_buffer[record_index];
                 p->timestamp_us = to_us_since_boot(t_now);
-                p->ax = ax; p->ay = ay; p->az = az;
-                p->gx = (int16_t)angle;
-                p->gy = (int16_t)angleRate;
-                p->gz = motorSpeed;
-                p->left_enc = left_total; p->right_enc = right_total;
-                p->motor_cmd = actual_motor_cmd;
+                p->ax = ax;                         // Accelerometer X
+                p->ay = az;                         // Accelerometer Z
+                p->az = gy;                         // Gyro Y (raw)
+                p->gx = leftMotor;                  // Left motor command (actual)
+                p->gy = rightMotor;                 // Right motor command (actual)
+                p->gz = (int16_t)angle;             // Angle (degrees)
+                p->left_enc = left_total;
+                p->right_enc = right_total;
+                p->motor_cmd = motorSpeed;          // Base motor command
+                p->trajectory_error = (int16_t)risingAngleOffset;  // Trajectory error
                 record_index++;
             }
             last_update = t_now;
@@ -829,9 +874,11 @@ void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold)
         tight_loop_contents();
     }
     
-    printf("STAND: Complete. Mode: %s, Angle: %.1f deg\n", 
-           is_balancing ? "ACTIVE" : "inactive", angle);
-    bt_printf("STAND: Complete\n");
+    if (!is_recording) {
+        printf("STAND: Complete. Mode: %s, Angle: %.1f deg\n", 
+               is_balancing ? "ACTIVE" : "inactive", angle);
+        bt_printf("STAND: Complete\n");
+    }
 }
 
 void balance_move_to(int32_t left_target, int32_t right_target) {
@@ -850,7 +897,7 @@ void run_blocking_sequence() {
     if (sequence_length == 0) return;
 
     printf("SEQ: Starting sequence...\n");
-    record_index = 0;
+    is_recording = false;  // Don't record during INIT
     
     for (int i = 0; i < sequence_length; i++) {
         Step s = sequence[i];
@@ -858,6 +905,22 @@ void run_blocking_sequence() {
         switch (s.cmd_type) {
             case CMD_INIT:
                 calibrate_gyros(s.duration_ms);
+                // Print all control parameters before recording starts
+                printf("\n=== CONTROL PARAMETERS ===\n");
+                printf("Initial angle: %.2f deg\n", angle);
+                printf("Gyro zeros: GX=%d, GY=%d, GZ=%d\n", gx_zero, gy_zero, gz_zero);
+                printf("ANGLE_RESPONSE: %d\n", ANGLE_RESPONSE);
+                printf("ANGLE_RATE_RATIO: %d\n", ANGLE_RATE_RATIO);
+                printf("DISTANCE_DIFF_RESPONSE: %d\n", DISTANCE_DIFF_RESPONSE);
+                printf("GEAR_RATIO: %d\n", GEAR_RATIO);
+                printf("MOTOR_SPEED_LIMIT: %d\n", MOTOR_SPEED_LIMIT);
+                printf("Update rate: %d ms (%.1f Hz)\n", UPDATE_TIME_MS, 1000.0f/UPDATE_TIME_MS);
+                printf("==========================\n\n");
+                
+                // Start recording AFTER parameter dump
+                record_index = 0;
+                is_recording = true;
+                printf("SEQ: Recording started\n");
                 break;
             case CMD_STAND:
                 balance_stand_up(s.left_speed, s.right_speed, s.stand_trigger);
@@ -886,18 +949,31 @@ void run_blocking_sequence() {
                         integrateEncoders();
                         
                         if (is_balancing) {
-                            balance_update();
+                            balance_update();  // This calculates risingAngleOffset
+                        } else {
+                            // Calculate trajectory error for recording even if not balancing
+                            risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
                         }
                         
-                        if (record_index < MAX_RECORD_SAMPLES) {
+                        // Calculate actual motor commands for recording
+                        int32_t distanceDiff = distanceLeft - distanceRight;
+                        int16_t leftMotor = motorSpeed + (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+                        int16_t rightMotor = motorSpeed - (distanceDiff * DISTANCE_DIFF_RESPONSE) / 100;
+                        
+                        // Only record if recording is active
+                        if (is_recording && record_index < MAX_RECORD_SAMPLES) {
                             DataPoint *p = &record_buffer[record_index];
                             p->timestamp_us = to_us_since_boot(t_now);
-                            p->ax = ax; p->ay = ay; p->az = az;
-                            p->gx = (int16_t)angle;  // Angle in degrees
-                            p->gy = (int16_t)angleRate;  // Rate in deg/s
-                            p->gz = motorSpeed;  // Accumulated motor speed
-                            p->left_enc = left_total; p->right_enc = right_total;
-                            p->motor_cmd = actual_motor_cmd;
+                            p->ax = ax;                         // Accelerometer X
+                            p->ay = az;                         // Accelerometer Z
+                            p->az = gy;                         // Gyro Y (raw)
+                            p->gx = leftMotor;                  // Left motor command (actual)
+                            p->gy = rightMotor;                 // Right motor command (actual)
+                            p->gz = (int16_t)angle;             // Angle (degrees)
+                            p->left_enc = left_total;
+                            p->right_enc = right_total;
+                            p->motor_cmd = motorSpeed;          // Base motor command
+                            p->trajectory_error = (int16_t)risingAngleOffset;  // Trajectory error
                             record_index++;
                         }
                         last_update = t_now;
@@ -909,7 +985,8 @@ void run_blocking_sequence() {
     }
     balboa_set_speeds(0, 0);
     is_balancing = false;
-    printf("SEQ: Complete.\n");
+    is_recording = false;  // Stop recording at end
+    printf("SEQ: Complete. Recorded %d samples.\n", record_index);
     bt_printf("SEQ: Complete.\n");
 }
 
@@ -946,8 +1023,12 @@ int main() {
     printf("--- RP2035 Ready ---\n");
 
     while (true) {
-        check_usb_input();
-        cyw43_arch_poll();
+        // Skip USB/BT during critical recording period
+        if (!is_recording) {
+            check_usb_input();
+            cyw43_arch_poll();
+        }
+        
         if (start_run_request) { start_run_request = false; run_blocking_sequence(); }
         if (start_read_request) { start_read_request = false; read_sequence(); }
         if (start_dma_dump_request) { start_dma_dump_request = false; dma_dump_sequence(); }
