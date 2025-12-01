@@ -1,7 +1,14 @@
+// Pico_Balboa.c
+// Generated: November 30, 2024 at 16:45 UTC
+// Raspberry Pi Pico 2 W - Balboa Robot Balance Controller
+// Pololu-style algorithm: Gyro integration, incremental motor control, differential correction
+// No encoder position/velocity feedback, angle-based fall detection
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -42,13 +49,7 @@
 #define OUTX_L_G    0x22
 
 // --- CONFIG VALUES ---
-// CTRL2_G gyro config: 0b0101_XX_00 where XX is full-scale:
-//   00 = ±250 dps (most sensitive, may saturate)
-//   01 = ±500 dps 
-//   10 = ±1000 dps
-//   11 = ±2000 dps (least sensitive)
-// ODR = 0101 = 208 Hz
-#define NORMAL_MODE_208HZ 0x58  // 208 Hz, ±1000 dps (was 0x50 = ±250 dps)
+#define NORMAL_MODE_208HZ 0x58  // 208 Hz, ±1000 dps
 #define RESET_STEPS       0x02
 #define SET_FUNC_EN       0xBD
 
@@ -63,16 +64,16 @@
 #define MAX_STEPS 50
 
 // --- BALANCING CONFIGURATION ---
-#define UPDATE_TIME_MS 10           // 100 Hz update rate for balance loop
-#define DEFAULT_INIT_TIME_MS 1000   // Default calibration time
+#define UPDATE_TIME_MS 10           // 100 Hz update rate
+#define DEFAULT_INIT_TIME_MS 1000
 
 // Step command types
 typedef enum {
-    CMD_DRIVE,      // Normal motor drive command
-    CMD_INIT,       // Initialize/calibrate gyros
-    CMD_STAND,      // Stand up (placeholder)
-    CMD_MOVE,       // Move while balancing (placeholder)
-    CMD_STOP        // Stop balancing
+    CMD_DRIVE,      
+    CMD_INIT,       
+    CMD_STAND,      
+    CMD_MOVE,       
+    CMD_STOP        
 } CommandType;
 
 typedef struct {
@@ -84,13 +85,13 @@ typedef struct {
 } DataPoint;
 
 typedef struct {
-    CommandType cmd_type;           // Type of command
-    uint32_t duration_ms;           // Duration for DRIVE, INIT
-    int16_t left_speed;             // Left motor speed for DRIVE
-    int16_t right_speed;            // Right motor speed for DRIVE
-    int32_t move_left;              // Target encoder counts for MOVE
-    int32_t move_right;             // Target encoder counts for MOVE
-    int32_t stand_trigger;          // Gyro integral trigger for STAND
+    CommandType cmd_type;           
+    uint32_t duration_ms;           
+    int16_t left_speed;             // Phase 1 speed for STAND
+    int16_t right_speed;            // Phase 2 speed for STAND
+    int32_t move_left;              
+    int32_t move_right;             
+    int32_t stand_trigger;          
 } Step;
 
 DataPoint record_buffer[MAX_RECORD_SAMPLES];
@@ -122,36 +123,48 @@ int16_t ax, ay, az;
 int16_t gx, gy, gz;
 
 // --- BALANCING STATE VARIABLES ---
-int16_t gx_zero = 0;  // Gyro zero offsets (calibrated during INIT)
+int16_t gx_zero = 0;
 int16_t gy_zero = 0;
 int16_t gz_zero = 0;
 
-bool is_balancing = false;  // True when in balancing mode
-int32_t target_left = 0;    // Target encoder position for MOVE command
-int32_t target_right = 0;   // Target encoder position for MOVE command
+bool is_balancing = false;
+int32_t target_left = 0;
+int32_t target_right = 0;
 
-// Gyro integral and derivative for balancing
-int32_t gy_integral = 0;    // Integral of gyro Y (angle estimate)
-int16_t gy_prev = 0;        // Previous gyro Y reading for derivative
-int16_t gy_derivative = 0;  // Derivative of gyro Y (angular acceleration)
-int32_t pid_integral = 0;   // PID integral term (accumulated error)
+// PID Variables
+float pid_integral_error = 0.0f; // Accumulator for I term
 
-// PID parameters
-float balance_kp = 0.4;     // Proportional gain (adjusted for ±1000 dps)
-float balance_ki = 0.0;     // Integral gain
-float balance_kd = 4.0;     // Derivative gain (adjusted for ±1000 dps)
 
-// PID component values for recording
-int16_t pid_p = 0;  // P term value
-int16_t pid_d = 0;  // D term value
-int16_t actual_motor_cmd = 0;  // Actual motor command sent to motors
+float angle = 0.0f;               // Angle in degrees (0 = vertical)
+float angleRate = 0.0f;           // Angular rate in degrees/s
+int16_t motorSpeed = 0;           // Accumulated motor speed command
+int32_t distanceLeft = 0;         // Left encoder position (for differential correction)
+int32_t distanceRight = 0;        // Right encoder position (for differential correction)
 
-char usb_cmd_buffer[64]; // Increased size for STEP params
+// Pololu-style control gains (tunable at runtime)
+int16_t ANGLE_RATE_RATIO = 140;      // Physical constant relating angle to rate
+int16_t ANGLE_RESPONSE = 11;         // Trajectory stabilization gain
+int16_t DISTANCE_DIFF_RESPONSE = -50; // Differential correction gain
+int16_t GEAR_RATIO = 111;            // Overall gear ratio
+int16_t MOTOR_SPEED_LIMIT = 300;     // Maximum motor speed
+
+// PID parameters (Defaults, adjust via PID command)
+// Note: P is now acting on Accel Z, D is acting on Gyro Y
+float balance_kp = 1.0f;    // Proportional gain (Accel Z error)
+float balance_ki = 0.00;    // Integral gain (Accel Z accumulation)
+float balance_kd = 0.50;    // Derivative gain (Gyro Y rate)
+
+// PID component values for recording/debugging
+int16_t pid_p = 0;
+int16_t pid_d = 0;
+int16_t actual_motor_cmd = 0;
+
+char usb_cmd_buffer[64];
 int usb_cmd_idx = 0;
 
 // Bluetooth Globals
 static uint16_t rfcomm_channel_id = 0; 
-static char bt_cmd_buffer[64]; // Increased size for STEP params
+static char bt_cmd_buffer[64]; 
 static int bt_cmd_idx = 0;
 
 // Flags for Main Loop execution
@@ -356,9 +369,6 @@ void dma_dump_sequence() {
         printf("%d,0x%08X,0x%08X\n", i, left_dma_buffer[i], right_dma_buffer[i]);
         bt_printf("%d,0x%08X,0x%08X\n", i, left_dma_buffer[i], right_dma_buffer[i]);
         
-        // Poll frequently to prevent BT buffer overflow or connection timeouts during large dump
-        // INCREASED DELAY: Printing 1024 lines too fast floods the BT buffer.
-        // We now pause for 10ms every 16 lines to let the stack drain.
         if ((i & 0x0F) == 0) { 
             cyw43_arch_poll();
             sleep_ms(10);
@@ -393,8 +403,10 @@ void show_sequence() {
                 bt_printf("  Step %d: INIT Dur=%dms\n", i, s.duration_ms);
                 break;
             case CMD_STAND:
-                printf("  Step %d: STAND (trigger=%ld)\n", i, (long)s.stand_trigger);
-                bt_printf("  Step %d: STAND (trigger=%ld)\n", i, (long)s.stand_trigger);
+                printf("  Step %d: STAND s1=%d, s2=%d (trig=%ld)\n", 
+                       i, s.left_speed, s.right_speed, (long)s.stand_trigger);
+                bt_printf("  Step %d: STAND s1=%d, s2=%d (trig=%ld)\n", 
+                          i, s.left_speed, s.right_speed, (long)s.stand_trigger);
                 break;
             case CMD_MOVE:
                 printf("  Step %d: MOVE L=%ld, R=%ld\n", i, s.move_left, s.move_right);
@@ -417,7 +429,7 @@ void print_help() {
     printf("  READ            : Offload recorded data (CSV format)\n");
     printf("  STEP i,ms,l,r   : Set step [i] DRIVE with dur[ms] and speeds [l],[r]\n");
     printf("  INIT i[,ms]     : Set step [i] gyro calibration (default 1000ms)\n");
-    printf("  STAND i[,trig]  : Set step [i] to stand up (AX trigger=%d default)\n", 8000);
+    printf("  STAND i,s1,s2   : Set step [i] stand. Phase1/2 speeds s1,s2. [trig] optional\n");
     printf("  MOVE i,l,r      : Set step [i] to move [l],[r] encoder counts\n");
     printf("  STOP i          : Set step [i] to stop balancing\n");
     printf("  PID p,i,d       : Set PID gains (P, I, D)\n");
@@ -429,7 +441,7 @@ void print_help() {
     bt_printf("  RUN, READ, SHOW_SEQ, DMA, HELP\n");
     bt_printf("  STEP i,ms,l,r\n");
     bt_printf("  INIT i[,ms]\n");
-    bt_printf("  STAND i[,trig]\n");
+    bt_printf("  STAND i,s1,s2[,trig]\n");
     bt_printf("  MOVE i,l,r\n");
     bt_printf("  STOP i\n");
     bt_printf("  PID p,i,d\n");
@@ -449,6 +461,7 @@ void read_sequence() {
     printf("DATA_START\n");
     bt_printf("DATA_START\n");
     
+    // Note: P term is stored in GX, D term in GZ for debugging
     printf("Idx,Time_us,AX,AY,AZ,GX,GY,GZ,LeftEnc,RightEnc,MotorCmd\n");
     bt_printf("Idx,Time_us,AX,AY,AZ,GX,GY,GZ,LeftEnc,RightEnc,MotorCmd\n");
 
@@ -496,192 +509,92 @@ void process_command(const char* cmd) {
         start_help_request = true;
     }
     else if (strncmp(cmd, "STEP", 4) == 0) {
-        // Format: STEP idx, duration, left, right
         int idx, dur, l, r;
-        // Try parsing with commas
         int matches = sscanf(cmd + 4, "%d, %d, %d, %d", &idx, &dur, &l, &r);
-        if (matches < 4) {
-             // Try parsing with spaces if commas fail
-             matches = sscanf(cmd + 4, "%d %d %d %d", &idx, &dur, &l, &r);
-        }
+        if (matches < 4) matches = sscanf(cmd + 4, "%d %d %d %d", &idx, &dur, &l, &r);
 
-        if (matches == 4) {
-            if (idx >= 0 && idx < MAX_STEPS) {
-                sequence[idx].cmd_type = CMD_DRIVE;
-                sequence[idx].duration_ms = dur;
-                sequence[idx].left_speed = (int16_t)l;
-                sequence[idx].right_speed = (int16_t)r;
-                sequence[idx].move_left = 0;
-                sequence[idx].move_right = 0;
-                
-                // Update sequence length if we added a new step at the end
-                if (idx >= sequence_length) {
-                    sequence_length = idx + 1;
-                }
-                
-                printf("CMD: Set Step %d: DRIVE %dms, L:%d, R:%d\n", idx, dur, l, r);
-                bt_printf("OK: Step %d set\n", idx);
-            } else {
-                printf("CMD: Error, Step Index %d out of bounds (Max %d)\n", idx, MAX_STEPS-1);
-                bt_printf("ERR: Index bounds\n");
-            }
-        } else {
-            printf("CMD: Error parsing STEP. Usage: STEP idx, dur, l, r\n");
-            bt_printf("ERR: Parse error\n");
+        if (matches == 4 && idx >= 0 && idx < MAX_STEPS) {
+            sequence[idx] = (Step){CMD_DRIVE, dur, (int16_t)l, (int16_t)r, 0, 0, 0};
+            if (idx >= sequence_length) sequence_length = idx + 1;
+            printf("CMD: Set Step %d: DRIVE %dms, L:%d, R:%d\n", idx, dur, l, r);
+            bt_printf("OK: Step %d set\n", idx);
         }
     }
     else if (strncmp(cmd, "INIT", 4) == 0) {
-        // Format: INIT idx [, duration_ms]
         int idx, dur = DEFAULT_INIT_TIME_MS;
         int matches = sscanf(cmd + 4, "%d, %d", &idx, &dur);
-        if (matches < 1) {
-            matches = sscanf(cmd + 4, "%d %d", &idx, &dur);
-        }
+        if (matches < 1) matches = sscanf(cmd + 4, "%d %d", &idx, &dur);
         
-        if (matches >= 1) {
-            if (idx >= 0 && idx < MAX_STEPS) {
-                sequence[idx].cmd_type = CMD_INIT;
-                sequence[idx].duration_ms = dur;
-                sequence[idx].left_speed = 0;
-                sequence[idx].right_speed = 0;
-                sequence[idx].move_left = 0;
-                sequence[idx].move_right = 0;
-                
-                if (idx >= sequence_length) {
-                    sequence_length = idx + 1;
-                }
-                
-                printf("CMD: Set Step %d: INIT %dms\n", idx, dur);
-                bt_printf("OK: Step %d INIT set\n", idx);
-            } else {
-                printf("CMD: Error, Step Index %d out of bounds\n", idx);
-                bt_printf("ERR: Index bounds\n");
-            }
-        } else {
-            printf("CMD: Error parsing INIT. Usage: INIT idx [, duration_ms]\n");
-            bt_printf("ERR: Parse error\n");
+        if (matches >= 1 && idx >= 0 && idx < MAX_STEPS) {
+            sequence[idx] = (Step){CMD_INIT, dur, 0, 0, 0, 0, 0};
+            if (idx >= sequence_length) sequence_length = idx + 1;
+            printf("CMD: Set Step %d: INIT %dms\n", idx, dur);
+            bt_printf("OK: Step %d INIT set\n", idx);
         }
     }
     else if (strncmp(cmd, "STAND", 5) == 0) {
-        // Format: STAND idx[, trigger]
-        int idx;
-        int trigger;
-        int matches = sscanf(cmd + 5, "%d, %d", &idx, &trigger);
-        if (matches < 2) {
-            matches = sscanf(cmd + 5, "%d %d", &idx, &trigger);
-        }
-        if (matches < 1) {
-            matches = sscanf(cmd + 5, "%d", &idx);
-            trigger = 8000;  // Default AX trigger value
-        }
+        int idx, s1, s2, trig = 8000;
+        int matches = sscanf(cmd + 5, "%d, %d, %d, %d", &idx, &s1, &s2, &trig);
+        if (matches < 3) matches = sscanf(cmd + 5, "%d, %d, %d", &idx, &s1, &s2);
+        if (matches < 3) matches = sscanf(cmd + 5, "%d %d %d %d", &idx, &s1, &s2, &trig);
         
-        if (matches >= 1) {
-            if (idx >= 0 && idx < MAX_STEPS) {
-                sequence[idx].cmd_type = CMD_STAND;
-                sequence[idx].duration_ms = 0;
-                sequence[idx].left_speed = 0;
-                sequence[idx].right_speed = 0;
-                sequence[idx].move_left = 0;
-                sequence[idx].move_right = 0;
-                sequence[idx].stand_trigger = trigger;
-                
-                if (idx >= sequence_length) {
-                    sequence_length = idx + 1;
-                }
-                
-                printf("CMD: Set Step %d: STAND (trigger=%ld)\n", idx, (long)trigger);
-                bt_printf("OK: Step %d STAND trigger=%ld\n", idx, (long)trigger);
-            } else {
-                printf("CMD: Error, Step Index %d out of bounds\n", idx);
-                bt_printf("ERR: Index bounds\n");
-            }
-        } else {
-            printf("CMD: Error parsing STAND. Usage: STAND idx[, trigger]\n");
-            bt_printf("ERR: Parse error\n");
+        if (matches >= 3 && idx >= 0 && idx < MAX_STEPS) {
+            sequence[idx] = (Step){CMD_STAND, 0, (int16_t)s1, (int16_t)s2, 0, 0, trig};
+            if (idx >= sequence_length) sequence_length = idx + 1;
+            printf("CMD: Set Step %d: STAND s1=%d s2=%d trig=%d\n", idx, s1, s2, trig);
+            bt_printf("OK: Step %d STAND set\n", idx);
         }
     }
     else if (strncmp(cmd, "MOVE", 4) == 0) {
-        // Format: MOVE idx, left_counts, right_counts
         int idx, l, r;
         int matches = sscanf(cmd + 4, "%d, %d, %d", &idx, &l, &r);
-        if (matches < 3) {
-            matches = sscanf(cmd + 4, "%d %d %d", &idx, &l, &r);
-        }
+        if (matches < 3) matches = sscanf(cmd + 4, "%d %d %d", &idx, &l, &r);
         
-        if (matches == 3) {
-            if (idx >= 0 && idx < MAX_STEPS) {
-                sequence[idx].cmd_type = CMD_MOVE;
-                sequence[idx].duration_ms = 0;
-                sequence[idx].left_speed = 0;
-                sequence[idx].right_speed = 0;
-                sequence[idx].move_left = l;
-                sequence[idx].move_right = r;
-                
-                if (idx >= sequence_length) {
-                    sequence_length = idx + 1;
-                }
-                
-                printf("CMD: Set Step %d: MOVE L:%d R:%d (placeholder)\n", idx, l, r);
-                bt_printf("OK: Step %d MOVE set\n", idx);
-            } else {
-                printf("CMD: Error, Step Index %d out of bounds\n", idx);
-                bt_printf("ERR: Index bounds\n");
-            }
-        } else {
-            printf("CMD: Error parsing MOVE. Usage: MOVE idx, left_counts, right_counts\n");
-            bt_printf("ERR: Parse error\n");
+        if (matches == 3 && idx >= 0 && idx < MAX_STEPS) {
+            sequence[idx] = (Step){CMD_MOVE, 0, 0, 0, l, r, 0};
+            if (idx >= sequence_length) sequence_length = idx + 1;
+            printf("CMD: Set Step %d: MOVE L:%d R:%d\n", idx, l, r);
+            bt_printf("OK: Step %d MOVE set\n", idx);
         }
     }
     else if (strncmp(cmd, "STOP", 4) == 0) {
-        // Format: STOP idx
         int idx;
-        if (sscanf(cmd + 4, "%d", &idx) == 1) {
-            if (idx >= 0 && idx < MAX_STEPS) {
-                sequence[idx].cmd_type = CMD_STOP;
-                sequence[idx].duration_ms = 0;
-                sequence[idx].left_speed = 0;
-                sequence[idx].right_speed = 0;
-                sequence[idx].move_left = 0;
-                sequence[idx].move_right = 0;
-                
-                if (idx >= sequence_length) {
-                    sequence_length = idx + 1;
-                }
-                
-                printf("CMD: Set Step %d: STOP (placeholder)\n", idx);
-                bt_printf("OK: Step %d STOP set\n", idx);
-            } else {
-                printf("CMD: Error, Step Index %d out of bounds\n", idx);
-                bt_printf("ERR: Index bounds\n");
-            }
-        } else {
-            printf("CMD: Error parsing STOP. Usage: STOP idx\n");
-            bt_printf("ERR: Parse error\n");
+        if (sscanf(cmd + 4, "%d", &idx) == 1 && idx >= 0 && idx < MAX_STEPS) {
+            sequence[idx] = (Step){CMD_STOP, 0, 0, 0, 0, 0, 0};
+            if (idx >= sequence_length) sequence_length = idx + 1;
+            printf("CMD: Set Step %d: STOP\n", idx);
+            bt_printf("OK: Step %d STOP set\n", idx);
         }
     }
     else if (strncmp(cmd, "PID", 3) == 0) {
-        // Format: PID p, i, d
         float p, i, d;
         int matches = sscanf(cmd + 3, "%f, %f, %f", &p, &i, &d);
-        if (matches < 3) {
-            matches = sscanf(cmd + 3, "%f %f %f", &p, &i, &d);
-        }
+        if (matches < 3) matches = sscanf(cmd + 3, "%f %f %f", &p, &i, &d);
         
         if (matches == 3) {
-            balance_kp = p;
+            // For Pololu-style: P maps to ANGLE_RESPONSE
+            ANGLE_RESPONSE = (int16_t)p;
+            balance_kp = p;  // Keep for compatibility
             balance_ki = i;
             balance_kd = d;
-            
-            printf("CMD: PID gains set - P=%.3f, I=%.3f, D=%.3f\n", p, i, d);
-            bt_printf("OK: PID P=%.3f, I=%.3f, D=%.3f\n", p, i, d);
-        } else {
-            printf("CMD: Error parsing PID. Usage: PID p, i, d\n");
-            bt_printf("ERR: Parse error\n");
+            printf("CMD: Pololu gains set - ANGLE_RESPONSE=%d\n", ANGLE_RESPONSE);
+            bt_printf("OK: ANGLE_RESPONSE=%d\n", ANGLE_RESPONSE);
         }
     }
-    else {
-        printf("Unknown Command: %s\n", cmd);
-        bt_printf("Unknown Command: %s\n", cmd);
+    else if (strncmp(cmd, "ANGLE", 5) == 0) {
+        int resp, ratio, diff;
+        int matches = sscanf(cmd + 5, "%d, %d, %d", &resp, &ratio, &diff);
+        if (matches < 3) matches = sscanf(cmd + 5, "%d %d %d", &resp, &ratio, &diff);
+        
+        if (matches == 3) {
+            ANGLE_RESPONSE = resp;
+            ANGLE_RATE_RATIO = ratio;
+            DISTANCE_DIFF_RESPONSE = diff;
+            printf("CMD: Pololu gains - RESP=%d, RATIO=%d, DIFF=%d\n", 
+                   ANGLE_RESPONSE, ANGLE_RATE_RATIO, DISTANCE_DIFF_RESPONSE);
+            bt_printf("OK: RESP=%d, RATIO=%d, DIFF=%d\n", 
+                     ANGLE_RESPONSE, ANGLE_RATE_RATIO, DISTANCE_DIFF_RESPONSE);
+        }
     }
 }
 
@@ -705,29 +618,28 @@ void check_usb_input() {
 
 // --- SEQUENCE HANDLERS (CALLED FROM MAIN) ---
 
-// Calibrate gyros by averaging readings while stationary
 void calibrate_gyros(uint32_t duration_ms) {
-    printf("INIT: Calibrating gyros for %dms (keep robot stationary)...\n", duration_ms);
-    bt_printf("INIT: Calibrating gyros for %dms...\n", duration_ms);
+    printf("INIT: Calibrating gyros for %dms...\n", duration_ms);
+    bt_printf("INIT: Calibrating...\n");
     
     int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+    int32_t sum_ax = 0, sum_az = 0;
     int sample_count = 0;
     
     absolute_time_t cal_end = make_timeout_time_ms(duration_ms);
     absolute_time_t last_sample = get_absolute_time();
     
     while (get_absolute_time() < cal_end) {
-        // Sample at ~100Hz
         if (absolute_time_diff_us(last_sample, get_absolute_time()) >= (UPDATE_TIME_MS * 1000)) {
             lsm6ds3_read_all();
             sum_gx += gx;
             sum_gy += gy;
             sum_gz += gz;
+            sum_ax += ax;
+            sum_az += az;
             sample_count++;
             last_sample = get_absolute_time();
         }
-        
-        // No BT interaction during sequence
         tight_loop_contents();
     }
     
@@ -736,397 +648,294 @@ void calibrate_gyros(uint32_t duration_ms) {
         gy_zero = sum_gy / sample_count;
         gz_zero = sum_gz / sample_count;
         
-        // Reset balancing state variables
-        gy_integral = 0;
-        gy_prev = 0;
-        pid_integral = 0;
+        // Compute initial angle from accelerometer
+        // Angle = 0 when vertical (AX = max, AZ = 0)
+        // Angle = 90° when lying flat (AX = 0, AZ = max)
+        int32_t avg_ax = sum_ax / sample_count;
+        int32_t avg_az = sum_az / sample_count;
+        angle = atan2f((float)avg_az, (float)avg_ax) * 180.0f / M_PI;
         
-        printf("INIT: Complete. Gyro zeros: GX=%d, GY=%d, GZ=%d (samples=%d)\n", 
-               gx_zero, gy_zero, gz_zero, sample_count);
-        bt_printf("INIT: Gyro zeros set (GX=%d, GY=%d, GZ=%d)\n", 
-                  gx_zero, gy_zero, gz_zero);
-    } else {
-        printf("INIT: Warning - no samples collected!\n");
-        bt_printf("INIT: Error - no samples\n");
+        // Reset control state
+        pid_integral_error = 0;
+        motorSpeed = 0;
+        angleRate = 0.0f;
+        distanceLeft = 0;
+        distanceRight = 0;
+        
+        printf("INIT: Gyro zeros: GX=%d, GY=%d, GZ=%d\n", gx_zero, gy_zero, gz_zero);
+        printf("INIT: Initial angle: %.2f deg (AX=%ld, AZ=%ld)\n", angle, avg_ax, avg_az);
+        bt_printf("INIT: Calibrated. Angle=%.1f deg\n", angle);
     }
 }
 
-// Balance control loop - PID controller based on gyro
+// Integrate gyro to update angle estimate
+void integrateGyro() {
+    // Convert gyro reading to deg/s
+    // LSM6DS3 at ±1000 dps: 1000 dps = 29000 counts (from LSM6 library scaling)
+    angleRate = (float)(gy - gy_zero) / 32.768; // deg/s
+    
+    // Integrate to get angle (UPDATE_TIME_MS = 10ms)
+    angle += angleRate * (UPDATE_TIME_MS / 1000.0f);
+    
+    // Drift compensation: 0.01% per millisecond = 0.1% per 10ms cycle
+    // Multiply by 0.999 (decay toward zero)
+    angle = angle * 0.999f;
+}
+
+// Track encoder positions for differential correction
+void integrateEncoders() {
+    static int32_t lastCountsLeft = 0;
+    static int32_t lastCountsRight = 0;
+    
+    int32_t countsLeft = left_total;
+    int32_t countsRight = right_total;
+    
+    // Update accumulated distances
+    distanceLeft += (countsLeft - lastCountsLeft);
+    distanceRight += (countsRight - lastCountsRight);
+    
+    lastCountsLeft = countsLeft;
+    lastCountsRight = countsRight;
+}
+
+// Balance Control Loop - POLOLU-STYLE WITH GYRO INTEGRATION
 void balance_update() {
-    // Get calibrated gyro reading
-    int16_t gy_calibrated = gy - gy_zero;
+    // 1. Update angle and encoder tracking
+    integrateGyro();
+    integrateEncoders();
     
-    // Update integral (angle estimate) with 0.25% decay per update
-    // dt = 10ms = 0.010 seconds at 100Hz
-    gy_integral += gy_calibrated * 10;  // 10ms in milliseconds
-    gy_integral = (int32_t)(gy_integral * 0.9975);  // 0.25% decay
+    // 2. Calculate rising angle offset (trajectory error)
+    // This represents how far we are from a stable trajectory to vertical
+    // Units: degrees (angleRate is deg/s, ANGLE_RATE_RATIO converts to deg)
+    float risingAngleOffset = angleRate * ANGLE_RATE_RATIO + angle;
     
-    // Calculate derivative (angular acceleration)
-    gy_derivative = gy_calibrated - gy_prev;
-    gy_prev = gy_calibrated;
+    // 3. Incremental motor speed update (Pololu-style)
+    // Note: No distance/speed feedback per user request, only trajectory stabilization
+    motorSpeed += (int16_t)((ANGLE_RESPONSE * risingAngleOffset) / 100.0f / GEAR_RATIO);
     
-    // PID integral term (accumulated error) with decay
-    pid_integral += gy_calibrated;
-    pid_integral = (int32_t)(pid_integral * 0.9975);  // 0.25% decay
+    // 4. Apply saturation
+    if (motorSpeed > MOTOR_SPEED_LIMIT) motorSpeed = MOTOR_SPEED_LIMIT;
+    if (motorSpeed < -MOTOR_SPEED_LIMIT) motorSpeed = -MOTOR_SPEED_LIMIT;
     
-    // PID control law
-    // Error is the gyro reading itself (we want it to be zero)
-    // P term: proportional to gyro (angular rate)
-    // I term: proportional to integral of error
-    // D term: proportional to derivative (angular acceleration)
-    float p_term = balance_kp * gy_calibrated;
-    float i_term = balance_ki * pid_integral;
-    float d_term = balance_kd * gy_derivative;
+    // 5. Add differential correction for turning
+    // Prevents rotation while rocking back and forth
+    int32_t distanceDiff = distanceLeft - distanceRight;
+    int16_t leftMotor = motorSpeed + (int16_t)((distanceDiff * DISTANCE_DIFF_RESPONSE) / 100);
+    int16_t rightMotor = motorSpeed - (int16_t)((distanceDiff * DISTANCE_DIFF_RESPONSE) / 100);
     
-    float motor_command = p_term + i_term + d_term;
+    // 6. Send commands to motors
+    balboa_set_speeds(leftMotor, rightMotor);
+    actual_motor_cmd = motorSpeed;
     
-    // Save P and D components for recording
-    pid_p = (int16_t)p_term;
-    pid_d = (int16_t)d_term;
+    // Store components for debugging/recording
+    pid_p = (int16_t)risingAngleOffset;  // Trajectory error in degrees
+    pid_d = (int16_t)angleRate;          // Angular rate in deg/s
     
-    // Faster decay when near zero
-    if (abs(motor_command) < 10) {
-        pid_integral = (int32_t)(pid_integral * 0.90);  // Faster decay when near zero
+    // 7. Fall detection based on angle
+    static int fall_angle_count = 0;
+    if (fabsf(angle) > 30.0f) {  // Beyond 30 degrees from vertical
+        if (++fall_angle_count > 5) {  // 50ms of being too far
+            printf("FALL DETECTED: Angle=%.1f degrees\n", angle);
+            bt_printf("FALL DETECTED: Angle too large\n");
+            is_balancing = false;
+            motorSpeed = 0;
+            balboa_set_speeds(0, 0);
+            actual_motor_cmd = 0;
+            fall_angle_count = 0;
+        }
+    } else {
+        fall_angle_count = 0;
     }
-    
-    // Convert to integer and apply to motors
-    int16_t motor_speed = (int16_t)motor_command;
-    actual_motor_cmd = motor_speed;  // Save for recording
-    
-    // Apply motor command
-    balboa_set_speeds(motor_speed, motor_speed);
 }
 
-// Stand up routine with kick sequence
-void balance_stand_up(int32_t trigger_threshold) {
-    printf("STAND: Standing up with kick sequence (trigger=%ld)...\n", (long)trigger_threshold);
-    bt_printf("STAND: Standing up...\n");
+// Stand up routine - Pololu-style with angle-based triggering
+void balance_stand_up(int16_t speed1, int16_t speed2, int32_t trigger_threshold) {
+    printf("STAND: Pololu-style stand-up (s1=%d, s2=%d)...\n", speed1, speed2);
+    bt_printf("STAND: Starting stand-up\n");
     
-    // Reset gyro integral at start of stand
-    gy_integral = 0;
-    gy_prev = 0;
-    pid_integral = 0;
+    // Reset control state
+    motorSpeed = 0;
+    distanceLeft = 0;
+    distanceRight = 0;
     
-    // Phase 1: Drive backwards to rock back (250ms at -150)
-    printf("STAND: Phase 1 - Drive backwards (-150)\n");
-    balboa_set_speeds(-150, -150);
-    actual_motor_cmd = -150;  // Track actual command
-    
-    absolute_time_t phase1_end = make_timeout_time_ms(250);
+    // Phase 1: Backward kick (400ms at negative full speed)
+    balboa_set_speeds(-MOTOR_SPEED_LIMIT, -MOTOR_SPEED_LIMIT);
+    actual_motor_cmd = -MOTOR_SPEED_LIMIT;
+    absolute_time_t phase1_end = make_timeout_time_ms(400);
     absolute_time_t last_update = get_absolute_time();
     
     while (get_absolute_time() < phase1_end) {
         absolute_time_t t_now = get_absolute_time();
-        
-        // Record data at 100Hz during kick
         if (absolute_time_diff_us(last_update, t_now) >= (UPDATE_TIME_MS * 1000)) {
             lsm6ds3_read_all();
             update_counts();
-            
-            // Update gyro integral
-            int16_t gy_calibrated = gy - gy_zero;
-            gy_integral += gy_calibrated * 10;  // 10ms timestep
+            integrateGyro();
+            integrateEncoders();
             
             if (record_index < MAX_RECORD_SAMPLES) {
                 DataPoint *p = &record_buffer[record_index];
                 p->timestamp_us = to_us_since_boot(t_now);
                 p->ax = ax; p->ay = ay; p->az = az;
-                p->gx = pid_p;  // Store P component instead of gx
-                p->gy = gy - gy_zero;
-                p->gz = pid_d;  // Store D component instead of gz
-                p->left_enc = left_total;
-                p->right_enc = right_total;
-                p->motor_cmd = actual_motor_cmd;  // Record actual command
+                p->gx = (int16_t)angle;  // Angle in degrees
+                p->gy = (int16_t)angleRate;  // Rate in deg/s
+                p->gz = motorSpeed;
+                p->left_enc = left_total; p->right_enc = right_total;
+                p->motor_cmd = actual_motor_cmd;
                 record_index++;
             }
-            
             last_update = t_now;
         }
-        
-        // No BT interaction during sequence
         tight_loop_contents();
     }
     
-    // Phase 2: Drive forwards to tip upright (250ms at +150)
-    printf("STAND: Phase 2 - Drive forwards (+150)\n");
+    // Phase 2: Forward drive (up to 200ms or until angle < 60°)
     balboa_set_speeds(150, 150);
-    actual_motor_cmd = 150;  // Track actual command
-    
-    absolute_time_t phase2_end = make_timeout_time_ms(250);
+    actual_motor_cmd = 150;
+    absolute_time_t phase2_end = make_timeout_time_ms(200);
     last_update = get_absolute_time();
     
     while (get_absolute_time() < phase2_end) {
         absolute_time_t t_now = get_absolute_time();
-        
-        // Record data at 100Hz during kick
         if (absolute_time_diff_us(last_update, t_now) >= (UPDATE_TIME_MS * 1000)) {
             lsm6ds3_read_all();
             update_counts();
+            integrateGyro();
+            integrateEncoders();
             
-            // Update gyro integral for PID
-            int16_t gy_calibrated = gy - gy_zero;
-            gy_integral += gy_calibrated * 10;  // 10ms timestep
-            
-            // Check if we should start balancing based on AX (forward acceleration)
-            if (!is_balancing && ax > trigger_threshold) {
-                is_balancing = true;
-                printf("STAND: Balance triggered at AX=%d (threshold=%ld)\n", ax, (long)trigger_threshold);
+            // Check if close enough to vertical (angle < 60°)
+            if (fabsf(angle) < 60.0f) {
+                printf("STAND: Triggered at angle=%.1f degrees\n", angle);
                 bt_printf("STAND: Balancing started\n");
-            }
-            
-            // If balancing is active, run balance algorithm (updates actual_motor_cmd)
-            if (is_balancing) {
-                balance_update();
+                is_balancing = true;
+                motorSpeed = 150;  // Pre-load motor speed
+                distanceLeft = 0;   // Reset for differential correction
+                distanceRight = 0;
+                break;
             }
             
             if (record_index < MAX_RECORD_SAMPLES) {
                 DataPoint *p = &record_buffer[record_index];
                 p->timestamp_us = to_us_since_boot(t_now);
                 p->ax = ax; p->ay = ay; p->az = az;
-                p->gx = pid_p;  // Store P component instead of gx
-                p->gy = gy - gy_zero;
-                p->gz = pid_d;  // Store D component instead of gz
-                p->left_enc = left_total;
-                p->right_enc = right_total;
-                p->motor_cmd = actual_motor_cmd;  // Record actual command (200 or PID value)
+                p->gx = (int16_t)angle;
+                p->gy = (int16_t)angleRate;
+                p->gz = motorSpeed;
+                p->left_enc = left_total; p->right_enc = right_total;
+                p->motor_cmd = actual_motor_cmd;
                 record_index++;
             }
-            
             last_update = t_now;
         }
-        
-        // No BT interaction during sequence
         tight_loop_contents();
     }
     
-    // Stop motors after kick (only if not balancing)
-    if (!is_balancing) {
-        balboa_set_speeds(0, 0);
-        actual_motor_cmd = 0;
-    }
-    
-    // Continue recording for 0.5 seconds after motors stop
-    absolute_time_t post_kick_end = make_timeout_time_ms(500);
-    last_update = get_absolute_time();
-    
-    while (get_absolute_time() < post_kick_end) {
-        absolute_time_t t_now = get_absolute_time();
-        
-        // Record data at 100Hz after kick
-        if (absolute_time_diff_us(last_update, t_now) >= (UPDATE_TIME_MS * 1000)) {
-            lsm6ds3_read_all();
-            update_counts();
-            
-            // Update gyro integral for PID
-            int16_t gy_calibrated = gy - gy_zero;
-            gy_integral += gy_calibrated * 10;  // 10ms timestep
-            
-            // Check if we should start balancing based on AX
-            if (!is_balancing && ax > trigger_threshold) {
-                is_balancing = true;
-                printf("STAND: Balance triggered at AX=%d (threshold=%ld)\n", ax, (long)trigger_threshold);
-                bt_printf("STAND: Balancing started\n");
-            }
-            
-            // If balancing is active, run balance algorithm (updates actual_motor_cmd)
-            if (is_balancing) {
-                balance_update();
-            }
-            
-            if (record_index < MAX_RECORD_SAMPLES) {
-                DataPoint *p = &record_buffer[record_index];
-                p->timestamp_us = to_us_since_boot(t_now);
-                p->ax = ax; p->ay = ay; p->az = az;
-                p->gx = pid_p;  // Store P component instead of gx
-                p->gy = gy - gy_zero;
-                p->gz = pid_d;  // Store D component instead of gz
-                p->left_enc = left_total;
-                p->right_enc = right_total;
-                p->motor_cmd = actual_motor_cmd;  // Record actual command (0 or PID value)
-                record_index++;
-            }
-            
-            last_update = t_now;
-        }
-        
-        // No BT interaction during sequence
-        tight_loop_contents();
-    }
-    
-    printf("STAND: Complete. Balancing mode: %s\n", is_balancing ? "ACTIVE" : "inactive");
+    printf("STAND: Complete. Mode: %s, Angle: %.1f deg\n", 
+           is_balancing ? "ACTIVE" : "inactive", angle);
     bt_printf("STAND: Complete\n");
 }
 
-// Placeholder: Move to target position while balancing
 void balance_move_to(int32_t left_target, int32_t right_target) {
-    printf("MOVE: Moving to L=%ld, R=%ld (placeholder - not implemented)\n", 
-           left_target, right_target);
-    bt_printf("MOVE: Placeholder (L=%ld, R=%ld)\n", left_target, right_target);
-    // TODO: Implement position-controlled balancing
-    // - Set target encoder positions
-    // - Balance while moving toward target
-    // - Use distance feedback in balance controller
-    target_left = left_target;
-    target_right = right_target;
+    printf("MOVE: Placeholder (L=%ld, R=%ld)\n", left_target, right_target);
+    bt_printf("MOVE: Placeholder\n");
 }
 
-// Placeholder: Stop balancing
 void balance_stop() {
-    printf("STOP: Stopping balance mode\n");
+    printf("STOP: Balance stopped\n");
     bt_printf("STOP: Balance stopped\n");
     is_balancing = false;
     balboa_set_speeds(0, 0);
 }
 
 void run_blocking_sequence() {
-    if (sequence_length == 0) {
-        printf("SEQ: No steps defined.\n");
-        bt_printf("SEQ: No steps defined.\n");
-        return;
-    }
+    if (sequence_length == 0) return;
 
-    printf("SEQ: Starting sequence with %d steps...\n", sequence_length);
+    printf("SEQ: Starting sequence...\n");
     record_index = 0;
-    absolute_time_t run_start_time = get_absolute_time();
     
     for (int i = 0; i < sequence_length; i++) {
         Step s = sequence[i];
         
-        // Print step info based on command type
-        switch (s.cmd_type) {
-            case CMD_DRIVE:
-                printf("SEQ: Step %d - DRIVE: %dms, L:%d, R:%d\n", 
-                       i, s.duration_ms, s.left_speed, s.right_speed);
-                break;
-            case CMD_INIT:
-                printf("SEQ: Step %d - INIT: %dms calibration\n", i, s.duration_ms);
-                break;
-            case CMD_STAND:
-                printf("SEQ: Step %d - STAND\n", i);
-                break;
-            case CMD_MOVE:
-                printf("SEQ: Step %d - MOVE: L:%ld, R:%ld\n", 
-                       i, s.move_left, s.move_right);
-                break;
-            case CMD_STOP:
-                printf("SEQ: Step %d - STOP\n", i);
-                break;
-        }
-        
-        // Execute command based on type
         switch (s.cmd_type) {
             case CMD_INIT:
-                // Calibrate gyros
                 calibrate_gyros(s.duration_ms);
                 break;
-                
             case CMD_STAND:
-                // Stand up with trigger parameter
-                balance_stand_up(s.stand_trigger);
+                balance_stand_up(s.left_speed, s.right_speed, s.stand_trigger);
                 break;
-                
             case CMD_MOVE:
-                // Move while balancing (placeholder)
                 balance_move_to(s.move_left, s.move_right);
                 break;
-                
             case CMD_STOP:
-                // Stop balancing
                 balance_stop();
                 break;
-                
             case CMD_DRIVE:
             default:
-                // Normal drive command with scheduled timing
                 balboa_set_speeds(s.left_speed, s.right_speed);
-                actual_motor_cmd = s.left_speed;  // Track commanded speed
-                
-                absolute_time_t step_end_time = make_timeout_time_ms(s.duration_ms);
+                actual_motor_cmd = s.left_speed;
+                absolute_time_t step_end = make_timeout_time_ms(s.duration_ms);
                 absolute_time_t last_update = get_absolute_time();
                 
-                while (get_absolute_time() < step_end_time) {
+                while (get_absolute_time() < step_end) {
                     absolute_time_t t_now = get_absolute_time();
-                    
-                    // Run at 100Hz (10ms intervals)
-                    int64_t time_since_last_us = absolute_time_diff_us(last_update, t_now);
-                    if (time_since_last_us >= (UPDATE_TIME_MS * 1000)) {
-                        
-                        // Read sensors
+                    if (absolute_time_diff_us(last_update, t_now) >= (UPDATE_TIME_MS * 1000)) {
                         lsm6ds3_read_all();
                         update_counts();
                         
-                        // If balancing mode, call balance update (updates actual_motor_cmd)
+                        // Update angle estimate even if not balancing
+                        integrateGyro();
+                        integrateEncoders();
+                        
                         if (is_balancing) {
                             balance_update();
                         }
                         
-                        // Record data
                         if (record_index < MAX_RECORD_SAMPLES) {
                             DataPoint *p = &record_buffer[record_index];
                             p->timestamp_us = to_us_since_boot(t_now);
                             p->ax = ax; p->ay = ay; p->az = az;
-                            p->gx = pid_p;  // Store P component instead of gx
-                            p->gy = gy - gy_zero;
-                            p->gz = pid_d;  // Store D component instead of gz
-                            p->left_enc = left_total;
-                            p->right_enc = right_total;
-                            p->motor_cmd = actual_motor_cmd;  // Record actual command
+                            p->gx = (int16_t)angle;  // Angle in degrees
+                            p->gy = (int16_t)angleRate;  // Rate in deg/s
+                            p->gz = motorSpeed;  // Accumulated motor speed
+                            p->left_enc = left_total; p->right_enc = right_total;
+                            p->motor_cmd = actual_motor_cmd;
                             record_index++;
                         }
-                        
                         last_update = t_now;
                     }
-                    
-                    // No BT interaction during sequence
                     tight_loop_contents();
                 }
                 break;
         }
     }
-
-    // Stop motors at end
     balboa_set_speeds(0, 0);
     is_balancing = false;
-    
-    printf("SEQ: Complete. Recorded %d samples.\n", record_index);
-    bt_printf("SEQ: Complete. Recorded %d samples.\n", record_index);
+    printf("SEQ: Complete.\n");
+    bt_printf("SEQ: Complete.\n");
 }
-//===== END OF blocking sequence =====
 
-//===== MAIN FUNCTION =====
 int main() {
     stdio_init_all();
-    
     gpio_init(ENABLE_PIN); gpio_set_dir(ENABLE_PIN, GPIO_OUT); gpio_put(ENABLE_PIN, 1);
     gpio_init(L_X_PIN); gpio_set_dir(L_X_PIN, GPIO_IN); gpio_pull_down(L_X_PIN);
     gpio_init(L_B_PIN); gpio_set_dir(L_B_PIN, GPIO_IN); gpio_pull_down(L_B_PIN);
     gpio_init(R_X_PIN); gpio_set_dir(R_X_PIN, GPIO_IN); gpio_pull_down(R_X_PIN);
     gpio_init(R_B_PIN); gpio_set_dir(R_B_PIN, GPIO_IN); gpio_pull_down(R_B_PIN);
 
-    // Initialize Subsystems
     setup_pio_encoders();
     setup_dma_encoders();
     lsm6ds3_init();
     init_motor_i2c();
     balboa_set_speeds(0, 0);
     
-    // --- DEFAULT SEQUENCE ---
-    // Simple test: short forward, then stop
     sequence[0] = (Step){CMD_DRIVE, 100, 100, 100, 0, 0};
     sequence[1] = (Step){CMD_DRIVE, 1000, 0, 0, 0, 0};
     sequence_length = 2;
     
-    // --- BLUETOOTH INIT ---
-    if (cyw43_arch_init()) {
-        printf("failed to initialise cyw43_arch\n");
-        return -1;
-    }
+    if (cyw43_arch_init()) return -1;
     l2cap_init();
     rfcomm_init();
     rfcomm_register_service(packet_handler, 1, 0xffff); 
     sdp_init();
-    
-    // Re-generate SDP record
     spp_create_sdp_record((uint8_t*)spp_service_buffer, 0x10001, 1, "Pico_Balboa");
     sdp_register_service((uint8_t*)spp_service_buffer);
     gap_set_local_name("Pico_Balboa");
@@ -1134,41 +943,16 @@ int main() {
     gap_discoverable_control(1);
     hci_power_control(HCI_POWER_ON);
     
-    printf("--- RP2035 Ready (USB + Bluetooth). Waiting... ---\n");
+    printf("--- RP2035 Ready ---\n");
 
     while (true) {
-        // 1. Check USB Commands
         check_usb_input();
-        
-        // 2. Poll Bluetooth
         cyw43_arch_poll();
-
-        // 3. Handle Flags (Execution Context)
-        if (start_run_request) {
-            start_run_request = false;
-            run_blocking_sequence();
-        }
-
-        if (start_read_request) {
-            start_read_request = false;
-            read_sequence();
-        }
-
-        if (start_dma_dump_request) {
-            start_dma_dump_request = false;
-            dma_dump_sequence();
-        }
-
-        if (start_show_seq_request) {
-            start_show_seq_request = false;
-            show_sequence();
-        }
-
-        if (start_help_request) {
-            start_help_request = false;
-            print_help();
-        }
-
+        if (start_run_request) { start_run_request = false; run_blocking_sequence(); }
+        if (start_read_request) { start_read_request = false; read_sequence(); }
+        if (start_dma_dump_request) { start_dma_dump_request = false; dma_dump_sequence(); }
+        if (start_show_seq_request) { start_show_seq_request = false; show_sequence(); }
+        if (start_help_request) { start_help_request = false; print_help(); }
         sleep_ms(1);
     }
     return 0;

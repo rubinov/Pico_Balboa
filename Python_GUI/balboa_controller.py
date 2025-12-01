@@ -90,9 +90,11 @@ class BalboaController:
             if i == 0:  # INIT 1000
                 cmd_type.set("INIT")
                 param1.insert(0, "1000")
-            elif i == 1:  # STAND 1000
+            elif i == 1:  # STAND -150, 150, 8000
                 cmd_type.set("STAND")
-                param1.insert(0, "1000")
+                param1.insert(0, "-150") # Phase 1 Speed
+                param2.insert(0, "150")  # Phase 2 Speed
+                param3.insert(0, "8000") # Trigger
             elif i == 2:  # STEP 10000,0,0
                 cmd_type.set("STEP")
                 param1.insert(0, "10000")
@@ -155,7 +157,7 @@ class BalboaController:
         pid_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
         
         ttk.Label(pid_frame, text="P:").grid(row=0, column=0, padx=5)
-        self.pid_p_var = tk.StringVar(value="0.4")
+        self.pid_p_var = tk.StringVar(value="0.05")
         ttk.Entry(pid_frame, textvariable=self.pid_p_var, width=10).grid(row=0, column=1, padx=5)
         
         ttk.Label(pid_frame, text="I:").grid(row=0, column=2, padx=5)
@@ -163,7 +165,7 @@ class BalboaController:
         ttk.Entry(pid_frame, textvariable=self.pid_i_var, width=10).grid(row=0, column=3, padx=5)
         
         ttk.Label(pid_frame, text="D:").grid(row=0, column=4, padx=5)
-        self.pid_d_var = tk.StringVar(value="4.0")
+        self.pid_d_var = tk.StringVar(value="0.50")
         ttk.Entry(pid_frame, textvariable=self.pid_d_var, width=10).grid(row=0, column=5, padx=5)
         
         ttk.Button(pid_frame, text="Set", command=self.set_pid, width=10).grid(row=0, column=6, padx=10)
@@ -375,7 +377,7 @@ class BalboaController:
         """Load stand test preset"""
         presets = [
             ("INIT", "1000", "", ""),
-            ("STAND", "", "", ""),
+            ("STAND", "-150", "150", "8000"),  # UPDATED PARAMETERS
             ("STEP", "3000", "0", "0"),
             ("STOP", "", "", ""),
             ("", "", "", ""),
@@ -428,8 +430,16 @@ class BalboaController:
                     commands.append(f"INIT {i}, {dur}")
                     
                 elif cmd_type == "STAND":
-                    trig = int(p1) if p1 else 8000
-                    commands.append(f"STAND {i}, {trig}")
+                    # UPDATED: Now reads s1, s2, and trigger
+                    if not (p1 and p2):
+                         messagebox.showerror("Invalid Input", 
+                                           f"Step {i}: STAND requires speed1, speed2")
+                         return
+                    
+                    s1 = int(p1)
+                    s2 = int(p2)
+                    trig = int(p3) if p3 else 8000
+                    commands.append(f"STAND {i}, {s1}, {s2}, {trig}")
                     
                 elif cmd_type == "MOVE":
                     if not (p1 and p2):
